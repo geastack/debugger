@@ -72,6 +72,8 @@ Default endpoints: [preview](http://127.0.0.1:9222/preview),
 [discovery](http://127.0.0.1:9222/json/list), and
 `ws://127.0.0.1:9222/devtools/page/gea`. The board relay owns its serial connection;
 close it before using a serial monitor or device-control command.
+If attach reports `already in use (PID ...)`, close that process's debugger or
+serial monitor before retrying. A hidden DevTools window can still have a running relay.
 
 ## Inspect and edit
 
@@ -101,6 +103,9 @@ ESP32-S3 debug builds expose original TS/TSX source maps, line/column hardware
 breakpoints, Pause/Resume and Step Over/Into/Out. ESP-IDF's OpenOCD and Xtensa GDB
 use built-in USB JTAG. The relay verifies that the ELF matches the running
 firmware. Keep the matching build output when using `--attach`.
+Attach checks build folders in the app and its ancestor workspaces, selecting
+the ELF whose hash matches the running firmware. A missing-file warning refers
+to local build output; it does not determine whether firmware supports debugging.
 
 The chip has two hardware breakpoint slots. Stepping temporarily reserves a slot
 and skips helpers without app source mappings. Scope shows generated C++ locals;

@@ -881,22 +881,31 @@ export class NativeDebugger {
     await this.mi.close()
   }
 }
+export function selectNativeDebugBuild(builds, firmwareElfHash, readFile = readFileSync) {
+  if (firmwareElfHash) {
+    for (const build of builds) {
+      if (createHash('sha256').update(readFile(build.elf)).digest('hex') === firmwareElfHash)
+        return build
+    }
+  }
+  throw new Error(
+    'Native ELF does not match running firmware in any local debug build; rebuild without --attach before debugging source',
+  )
+}
+
 export async function createNativeDebugger({
   elf,
   metadata,
+  builds,
   gdbExecutable,
   openocdExecutable,
   serial,
   env = process.env,
   firmwareElfHash,
 }) {
-  if (
-    !firmwareElfHash ||
-    createHash('sha256').update(readFileSync(elf)).digest('hex') !== firmwareElfHash
-  )
-    throw new Error(
-      'Native ELF does not match running firmware; rebuild without --attach before debugging source',
-    )
+  const build = selectNativeDebugBuild(builds || [{ elf, metadata }], firmwareElfHash)
+  elf = build.elf
+  metadata = build.metadata
   if (!existsSync(metadata))
     throw new Error('Native source metadata is missing; rebuild without --attach')
   const info = JSON.parse(readFileSync(metadata, 'utf8'))

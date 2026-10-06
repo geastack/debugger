@@ -1,8 +1,15 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { TraceMap, originalPositionFor } from '@jridgewell/trace-mapping'
-import { parseMI, nativeSources, NativeDebugger, createNativeDebugger } from '../src/gdb.mjs'
+import {
+  parseMI,
+  nativeSources,
+  NativeDebugger,
+  createNativeDebugger,
+  selectNativeDebugBuild,
+} from '../src/gdb.mjs'
 import { DeviceTransport } from '../src/device.mjs'
 const file = fileURLToPath(new URL('./fixtures/native-source.ts', import.meta.url))
 const info = {
@@ -161,6 +168,28 @@ test('an ELF mismatch fails before starting any JTAG tools', async () => {
       openocdExecutable: 'must-not-start',
     }),
     /ELF does not match running firmware/,
+  )
+})
+
+test('attach selects the firmware-matching ELF and metadata despite a newer app-local build', () => {
+  const local = { elf: '/app/build/app.elf', metadata: '/app/build/source.json' }
+  const workspace = { elf: '/workspace/build/app.elf', metadata: '/workspace/build/source.json' }
+  const binaries = new Map([
+    [local.elf, Buffer.from('newer firmware')],
+    [workspace.elf, Buffer.from('running firmware')],
+  ])
+  const firmwareHash = createHash('sha256').update(binaries.get(workspace.elf)).digest('hex')
+  assert.equal(
+    selectNativeDebugBuild([local, workspace], firmwareHash, (name) => binaries.get(name)),
+    workspace,
+  )
+  assert.throws(
+    () => selectNativeDebugBuild([local], firmwareHash, (name) => binaries.get(name)),
+    /does not match running firmware/,
+  )
+  assert.throws(
+    () => selectNativeDebugBuild([workspace], undefined, (name) => binaries.get(name)),
+    /does not match running firmware/,
   )
 })
 
