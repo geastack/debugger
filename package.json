@@ -1,0 +1,57 @@
+{
+  "name": "@geastack/debugger",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/launch.mjs",
+    "./cdp": "./src/cdp.mjs",
+    "./native": "./src/native.mjs",
+    "./device": "./src/device.mjs",
+    "./package.json": "./package.json",
+    "./native/macos.mm": "./native/macos.mm"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 test/*.test.mjs",
+    "check": "node --check src/launch.mjs && node --check src/cdp.mjs && node --check src/native.mjs && node --check src/device.mjs && node --check src/gdb.mjs && node --check src/device-preview.mjs && node --check src/preview-fonts.mjs && node --check src/transport.mjs",
+    "prepublishOnly": "npm run check && npm test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@jridgewell/trace-mapping": "^0.3.31",
+    "postcss": "^8.5.29",
+    "ws": "^8.22.0"
+  },
+  "description": "Chrome DevTools adapters and live previews for Gea web, native macOS and ESP32 applications.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/geastack/debugger.git"
+  },
+  "homepage": "https://github.com/geastack/debugger#readme",
+  "bugs": {
+    "url": "https://github.com/geastack/debugger/issues"
+  },
+  "keywords": [
+    "gea",
+    "geastack",
+    "debugger",
+    "chrome-devtools",
+    "cdp",
+    "esp32",
+    "macos"
+  ],
+  "files": [
+    "src/",
+    "native/",
+    "docs/screenshots/",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "CONTRIBUTING.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

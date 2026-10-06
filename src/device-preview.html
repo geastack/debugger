@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Gea device preview</title>
+    <link rel="stylesheet" href="/preview/fonts.css" />
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: #181a1d;
+        color: #e8e9ec;
+        font: 14px system-ui;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        padding: 14px 20px;
+        border-bottom: 1px solid #35383e;
+        flex-wrap: wrap;
+      }
+      header strong {
+        margin-right: auto;
+      }
+      select {
+        background: #282b31;
+        color: inherit;
+        border: 1px solid #50545c;
+        border-radius: 6px;
+        padding: 8px;
+      }
+      main {
+        padding: 24px;
+        display: grid;
+        place-items: center;
+      }
+      #screen {
+        position: relative;
+        overflow: hidden;
+        background: black;
+        box-shadow: 0 8px 40px #0008;
+        flex: none;
+      }
+      #picture,
+      #mirror {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+      }
+      #picture {
+        object-fit: contain;
+      }
+      #highlight {
+        position: absolute;
+        border: 2px solid #45b5ff;
+        background: #45b5ff33;
+        pointer-events: none;
+        display: none;
+        z-index: 2147483647;
+      }
+      #status {
+        color: #b9bec8;
+      }
+      #note {
+        max-width: 650px;
+        color: #aab0ba;
+        line-height: 1.6;
+        margin: 20px auto;
+        text-align: center;
+      }
+      .native {
+        position: absolute;
+        margin: 0;
+        box-sizing: border-box;
+        white-space: pre;
+        pointer-events: none;
+      }
+      .canvas-crop {
+        position: absolute;
+        background-repeat: no-repeat;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <strong>Gea · device preview</strong
+      ><label
+        >View
+        <select id="mode">
+          <option value="screen">Device display · screenshots</option>
+          <option value="dom">DOM mirror · approximate</option>
+        </select></label
+      ><span id="status">Connecting…</span>
+    </header>
+    <main>
+      <div id="screen">
+        <img id="picture" alt="Actual device display" />
+        <div id="mirror" hidden></div>
+        <div id="highlight"></div>
+      </div>
+    </main>
+    <p id="note"></p>
+    <p style="text-align: center; color: #aab0ba; font-size: 12px">
+      Use the Gea DevTools window to inspect and edit the board. Keep this preview beside it.
+    </p>
+    <script type="module" src="/preview.mjs"></script>
+  </body>
+</html>
