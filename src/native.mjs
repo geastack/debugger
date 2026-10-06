@@ -16,7 +16,8 @@ export async function createNativeRelay({
   debugPort = portNumber(debugPort, '--debug-port')
   const host = `127.0.0.1:${debugPort}`
   const endpoint = `ws://${host}/devtools/page/gea`
-  const frontend = `devtools://devtools/bundled/inspector.html?ws=${host}/devtools/page/gea`
+  // inspector.html replaces protocol hover with a local screencast painter.
+  const frontend = `devtools://devtools/bundled/devtools_app.html?ws=${host}/devtools/page/gea`
   const target = {
     id: 'gea',
     type: 'page',

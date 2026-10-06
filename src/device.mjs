@@ -28,6 +28,9 @@ export class DeviceTransport {
     this.nextSequence = randomInt(1, 0x7fffffff)
     this.cached = null
     this.pendingSnapshot = null
+    this.highlight = 0
+    this.highlightRevision = 0
+    this.highlightWritten = 0
   }
   enqueue(action) {
     const result = this.tail.then(action)
@@ -92,6 +95,7 @@ export class DeviceTransport {
             height: Number(meta.height),
             debugFps: Number(meta.fps || 0),
             elf: meta.elf,
+            nativeHighlight: meta.overlay === '1',
           }
           if (nodes.size !== payload.length || !nodes.has(snapshot.root))
             throw new Error('Snapshot has duplicate identities or no mounted root')
@@ -119,25 +123,57 @@ export class DeviceTransport {
     return pending
   }
   mutate(request) {
-    return this.enqueue(async () => {
-      if (this.debuggerState?.paused)
-        throw new Error('Resume the native app before changing its tree or styles')
-      const encoded = Buffer.from(JSON.stringify({ ...request, boot: this.boot })).toString(
-        'base64',
-      )
-      if (encoded.length > 480)
-        throw new Error('Device operation exceeds the 480-byte USB request limit')
-      try {
-        const result = await this.serial.command(
-          `GEADEV DEBUG ${encoded}`,
-          ['GEADEV:DEBUG OK'],
-          8000,
-        )
-        return Number(/id=(\d+)/.exec(result)?.[1] || 0)
-      } finally {
-        this.cached = null
-      }
-    })
+    return this.enqueue(() => this.writeMutation(request))
+  }
+  async writeMutation(request) {
+    if (this.debuggerState?.paused)
+      throw new Error('Resume the native app before changing its tree or styles')
+    const encoded = Buffer.from(JSON.stringify({ ...request, boot: this.boot })).toString('base64')
+    if (encoded.length > 480)
+      throw new Error('Device operation exceeds the 480-byte USB request limit')
+    try {
+      const result = await this.serial.command(`GEADEV DEBUG ${encoded}`, ['GEADEV:DEBUG OK'], 8000)
+      return Number(/id=(\d+)/.exec(result)?.[1] || 0)
+    } finally {
+      if (request.op !== 'highlight') this.cached = null
+    }
+  }
+  setHighlight(id, color = { r: 0, g: 200, b: 255 }, owner = null) {
+    this.highlight = id
+    this.highlightOwner = id ? owner : null
+    this.highlightColor = color
+    this.highlightRevision++
+    return this.flushHighlight()
+  }
+  clearHighlight(owner) {
+    if (owner && this.highlightOwner !== owner) return Promise.resolve()
+    return this.setHighlight(0)
+  }
+  flushHighlight() {
+    if (!this.lastGood?.nativeHighlight || this.debuggerState?.paused) return Promise.resolve()
+    if (!this.highlightWrite) {
+      const pending = this.enqueue(async () => {
+        while (this.highlightWritten !== this.highlightRevision && !this.debuggerState?.paused) {
+          const revision = this.highlightRevision
+          const color = this.highlightColor || { r: 0, g: 200, b: 255 }
+          await this.writeMutation({
+            op: 'highlight',
+            id: this.highlight,
+            red: color.r,
+            green: color.g,
+            blue: color.b,
+          })
+          this.highlightWritten = revision
+        }
+      })
+      this.highlightWrite = pending
+      pending
+        .finally(() => {
+          if (this.highlightWrite === pending) this.highlightWrite = null
+        })
+        .catch(() => {})
+    }
+    return this.highlightWrite
   }
 }
 
@@ -684,6 +720,34 @@ export class DeviceSession {
     for (const name of new Set([...Object.keys(this.styles.get(id) || {}), ...Object.keys(next)]))
       await this.transport.mutate({ op: 'style', id, key: name, value: next[name] || '' })
   }
+  async highlightNode(nodeId, config) {
+    if (this.closed) throw new Error('Inspector session closed')
+    const id =
+      nodeId < 4 ? this.root : this.nodes.has(nodeId) ? nodeId : nodeId % 2 ? nodeId - 1 : nodeId
+    if (!this.nodes.has(id)) throw new Error('Stale highlight node')
+    const input = config?.contentColor || config?.borderColor || { r: 0, g: 200, b: 255 }
+    const color = Object.fromEntries(
+      ['r', 'g', 'b'].map((key) => {
+        const value = input[key] ?? 0
+        if (!Number.isFinite(value) || value < 0 || value > 255)
+          throw new Error('Invalid highlight color')
+        return [key, Math.round(value)]
+      }),
+    )
+    if (this.transport.setHighlight) await this.transport.setHighlight(id, color, this)
+    else this.transport.highlight = id
+    if (!this.transport.lastGood?.nativeHighlight && !this.highlightWarning) {
+      this.highlightWarning = true
+      this.emit('Log.entryAdded', {
+        entry: {
+          source: 'other',
+          level: 'warning',
+          text: 'Physical element highlights need newer debug firmware; rebuild without --attach. Preview highlights remain available.',
+          timestamp: Date.now(),
+        },
+      })
+    }
+  }
   async handle(method, p = {}) {
     if (this.transport.debuggerState) {
       const result = await this.transport.debuggerState.handle(this, this.emit, method, p)
@@ -762,16 +826,23 @@ export class DeviceSession {
     if (method === 'DOM.getAttributes') return { attributes: this.node(p.nodeId).attributes || [] }
     if (method === 'DOM.setInspectedNode') {
       this.selected = p.nodeId
-      this.transport.highlight = p.nodeId
+      await this.highlightNode(p.nodeId)
       return {}
     }
     if (method === 'Overlay.highlightNode' || method === 'DOM.highlightNode') {
-      this.transport.highlight =
-        p.nodeId || p.backendNodeId || (p.objectId ? this.object(p.objectId).__geaNodeId : 0)
+      await this.highlightNode(
+        p.nodeId || p.backendNodeId || (p.objectId ? this.object(p.objectId).__geaNodeId : 0),
+        p.highlightConfig,
+      )
       return {}
     }
-    if (method === 'Overlay.hideHighlight' || method === 'DOM.hideHighlight') {
-      this.transport.highlight = 0
+    if (
+      method === 'Overlay.hideHighlight' ||
+      method === 'DOM.hideHighlight' ||
+      method === 'Overlay.disable'
+    ) {
+      if (this.transport.clearHighlight) await this.transport.clearHighlight(this)
+      else this.transport.highlight = 0
       return {}
     }
     if (method === 'DOM.resolveNode')
@@ -1134,7 +1205,10 @@ export async function createDeviceRelay({
     })
     transport.debuggerState.onStateChange = (paused) => {
       if (paused) transport.abort?.abort(new Error('Native app paused'))
-      else transport.cached = null
+      else {
+        transport.cached = null
+        transport.flushHighlight().catch(() => {})
+      }
     }
     // JTAG setup happens before clients receive any lifetime identities.
     transport.cached = null
@@ -1145,8 +1219,10 @@ export async function createDeviceRelay({
       throw error
     }
   }
+  await transport.clearHighlight()
   const endpoint = `ws://127.0.0.1:${debugPort}/devtools/page/gea`
-  const frontend = `devtools://devtools/bundled/inspector.html?ws=127.0.0.1:${debugPort}/devtools/page/gea`
+  // inspector.html replaces protocol hover with a local screencast painter.
+  const frontend = `devtools://devtools/bundled/devtools_app.html?ws=127.0.0.1:${debugPort}/devtools/page/gea`
   const target = {
     id: 'gea',
     type: 'page',
@@ -1309,6 +1385,21 @@ export async function createDeviceRelay({
         )
         return
       }
+      if (
+        [
+          'Overlay.highlightNode',
+          'Overlay.hideHighlight',
+          'Overlay.disable',
+          'DOM.highlightNode',
+          'DOM.hideHighlight',
+        ].includes(request.method)
+      ) {
+        session.handle(request.method, request.params).then(
+          (result) => send({ id: request.id, result }),
+          (error) => send({ id: request.id, error: { code: -32000, message: error.message } }),
+        )
+        return
+      }
       if (queued >= 256) {
         send({
           id: request.id,
@@ -1364,15 +1455,24 @@ export async function createDeviceRelay({
     }, pollMs)
     timer.unref()
     ws.on('close', (code, reason) => {
+      session.closed = true
       if (process.env.GEA_DEBUGGER_TRACE === '1')
         console.error('CDP disconnected', code, reason.toString())
       clearInterval(timer)
       transport.debuggerState?.detach(session)
+      transport.clearHighlight(session).catch(() => {})
       sessions.delete(session)
       session.objects.clear()
     })
     ws.on('error', () => ws.close())
   })
+  const highlightHeartbeat = setInterval(() => {
+    if (transport.highlight)
+      transport
+        .setHighlight(transport.highlight, transport.highlightColor, transport.highlightOwner)
+        .catch(() => {})
+  }, 1000)
+  highlightHeartbeat.unref()
   await new Promise((resolve, reject) => {
     server.once('error', reject)
     server.listen(debugPort, '127.0.0.1', resolve)
@@ -1383,7 +1483,9 @@ export async function createDeviceRelay({
     preview,
     transport,
     async close() {
+      clearInterval(highlightHeartbeat)
       await transport.debuggerState?.close()
+      await transport.clearHighlight().catch(() => {})
       for (const ws of wss.clients) ws.terminate()
       wss.close()
       server.closeAllConnections()

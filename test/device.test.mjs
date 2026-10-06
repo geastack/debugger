@@ -511,3 +511,75 @@ test('deep subtree requests publish only missing children and preserve already-l
   await session.handle('DOM.requestChildNodes', { nodeId: 2, depth: -1 })
   assert.equal(events.length, count)
 })
+
+test('native hover uses lifetime identities and leaves DOM/CSS snapshots untouched', async () => {
+  const source = fixture()
+  const writes = []
+  const serial = {
+    collect: async (line) => {
+      const snapshot = await source.snapshot()
+      const frame = framed([...snapshot.nodes.values()], Number(line.split(' ').at(-1)))
+      frame.end += ' overlay=1'
+      return frame
+    },
+    command: async (line) => {
+      writes.push(JSON.parse(Buffer.from(line.slice('GEADEV DEBUG '.length), 'base64')))
+      return 'GEADEV:DEBUG OK id=0'
+    },
+  }
+  const transport = new DeviceTransport(serial)
+  const events = []
+  const session = new DeviceSession(transport, (method, params) => events.push({ method, params }))
+  await session.refresh()
+  const before = structuredClone(session.nodes)
+  await session.handle('Overlay.highlightNode', {
+    backendNodeId: 6,
+    highlightConfig: { contentColor: { r: 237, g: 17, b: 223, a: 0.7 } },
+  })
+  assert.deepEqual(writes[0], { op: 'highlight', id: 6, red: 237, green: 17, blue: 223, boot: '1' })
+  assert.deepEqual(session.nodes, before)
+  assert.ok(!events.some((event) => event.method === 'DOM.documentUpdated'))
+  await session.handle('Overlay.hideHighlight')
+  assert.equal(writes.at(-1).id, 0)
+  await assert.rejects(session.handle('Overlay.highlightNode', { nodeId: 900 }), /Stale/)
+  assert.equal(writes.length, 2)
+})
+
+test('hover bursts coalesce to the latest highlight; paused changes wait for resume', async () => {
+  const writes = []
+  let unblock, started
+  const begun = new Promise((resolve) => (started = resolve))
+  const blocked = new Promise((resolve) => (unblock = resolve))
+  const transport = new DeviceTransport({
+    command: async (line) => {
+      const operation = JSON.parse(Buffer.from(line.slice('GEADEV DEBUG '.length), 'base64'))
+      writes.push(operation)
+      if (writes.length === 1) {
+        started()
+        await blocked
+      }
+      return 'GEADEV:DEBUG OK id=0'
+    },
+  })
+  transport.lastGood = { nativeHighlight: true }
+  transport.boot = '1'
+  const ownerA = {},
+    ownerB = {}
+  const first = transport.setHighlight(4, undefined, ownerA)
+  await begun
+  const second = transport.setHighlight(6, undefined, ownerB)
+  const third = transport.setHighlight(8, undefined, ownerB)
+  await transport.clearHighlight(ownerA)
+  unblock()
+  await Promise.all([first, second, third])
+  assert.deepEqual(
+    writes.map((write) => write.id),
+    [4, 8],
+  )
+  transport.debuggerState = { paused: true }
+  await transport.clearHighlight(ownerB)
+  assert.equal(writes.length, 2)
+  transport.debuggerState.paused = false
+  await transport.flushHighlight()
+  assert.equal(writes.at(-1).id, 0)
+})

@@ -10,14 +10,17 @@ const endpoint = process.env.GEA_DEBUGGER_FRONTEND_TEST_ENDPOINT
 const appRoot = process.env.GEA_DEBUGGER_FRONTEND_TEST_APP
 const consoleName = process.env.GEA_DEBUGGER_FRONTEND_TEST_CONSOLE || 'Gea native inspector'
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-const visibleText = `(()=>{let out=[];function walk(n){if(n.nodeType===1&&['STYLE','SCRIPT'].includes(n.tagName))return;if(n.nodeType===3&&n.textContent.trim())out.push(n.textContent.trim());if(n.shadowRoot)walk(n.shadowRoot);for(let c of n.childNodes||[])walk(c)}walk(document.body);return out.join(' ')})()`
+const visibleText = `(()=>{let out=[];function walk(n){if(!n)return;if(n.nodeType===1&&['STYLE','SCRIPT'].includes(n.tagName))return;if(n.nodeType===3&&n.textContent.trim())out.push(n.textContent.trim());if(n.shadowRoot)walk(n.shadowRoot);for(let c of n.childNodes||[])walk(c)}walk(document.body);return out.join(' ')})()`
 
 test(
   'real Chrome DevTools frontend displays native tree/CSS and evaluates console scripts',
   { skip: !endpoint || !appRoot || !selector, timeout: 45000 },
   async () => {
     const url = new URL(endpoint)
-    const frontend = `devtools://devtools/bundled/inspector.html?ws=${url.host}${url.pathname}`
+    const advertised = await (await fetch(`http://${url.host}/json/list`)).json()
+    const frontend = advertised.find((target) => target.webSocketDebuggerUrl === endpoint)
+      ?.devtoolsFrontendUrl
+    assert.match(frontend, /\/devtools_app\.html\?/, 'the relay advertises protocol hover highlights')
     const browser = spawn(
       chromeExecutable(),
       chromeArgs({ appRoot, url: 'about:blank', debugPort: 15986, headless: true }),
@@ -44,6 +47,12 @@ test(
       }
       assert.ok(target, 'Chrome opened its actual DevTools frontend')
       cdp = await connectCDP(target.webSocketDebuggerUrl)
+      await cdp.send('Emulation.setDeviceMetricsOverride', {
+        width: 1400,
+        height: 900,
+        deviceScaleFactor: 1,
+        mobile: false,
+      })
       const evaluate = async (expression) => {
         const result = await cdp.send('Runtime.evaluate', {
           expression,
@@ -81,6 +90,42 @@ test(
       }
       assert.ok(selected)
       assert.match(text, /font-size|color/)
+      if (process.env.GEA_DEBUGGER_FRONTEND_TEST_HIGHLIGHT === '1') {
+        const point = await evaluate(`(()=>{
+          function find(root){
+            for(const element of root.querySelectorAll('*')){
+              if(element.shadowRoot){const point=find(element.shadowRoot);if(point)return point;}
+              if(!element.children.length&&element.textContent===${JSON.stringify(selector.replace(/^[.#]/, ''))}){
+                const rect=element.getBoundingClientRect();
+                if(rect.width&&rect.height)return {x:rect.x+rect.width/2,y:rect.y+rect.height/2};
+              }
+            }
+          }
+          return find(document);
+        })()`)
+        assert.ok(point, 'the Elements tree contains a visible attribute for the test selector')
+        const snapshotURL = `http://${url.host}/preview/snapshot`
+        const waitHighlight = async (id) => {
+          for (let i = 0; i < 50; i++) {
+            const snapshot = await (await fetch(snapshotURL)).json()
+            assert.equal(snapshot.nativeHighlight, true, 'current firmware supports physical highlights')
+            if (snapshot.highlight === id) return
+            await delay(100)
+          }
+          throw new Error(`Chrome hover did not set native highlight ${id}`)
+        }
+        await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 20, y: 10 })
+        await evaluate(`(async()=>{
+          const SDK=await import('./core/sdk/sdk.js');
+          return await SDK.TargetManager.TargetManager.instance().primaryPageTarget().overlayAgent().invoke_hideHighlight();
+        })()`)
+        await waitHighlight(0)
+        await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', ...point })
+        await waitHighlight(selected)
+        await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 1390, y: 200 })
+        await waitHighlight(0)
+        console.log('Chrome Elements mouse hover forwards physical highlight and clears on leave')
+      }
       const edited = await evaluate(`(async()=>{
       const SDK = await import('./core/sdk/sdk.js');
       const target = SDK.TargetManager.TargetManager.instance().primaryPageTarget();

@@ -131,8 +131,13 @@ Choose a view from the preview's selector; the browser remembers your choice.
 ![Device pixels](https://raw.githubusercontent.com/geastack/debugger/main/docs/screenshots/device.png)
 ![Structured DOM mirror](https://raw.githubusercontent.com/geastack/debugger/main/docs/screenshots/mirror.png)
 
-Selection highlights follow native bounds in both previews. Physical-board
-highlight overlays and preview click/touch forwarding are not implemented.
+Hovering or selecting an element highlights its live bounds in both previews
+and on boards with current debug firmware. The native outline leaves DOM/CSS
+unchanged, follows motion and clears on hover-out or disconnect. A short device
+lease also clears it after an abrupt host exit. Native highlights update after
+resume when the CPU is paused. Drawing the overlay requires full repaint while
+visible; use `--debug-fps 10` or `30` to leave room for inspection.
+Preview click/touch forwarding is not implemented.
 
 ## Library and development
 
