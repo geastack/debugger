@@ -221,6 +221,56 @@ test('USB snapshot parser rejects a reboot before recycled identities can be use
   await assert.rejects(transport.snapshot({ fresh: true }), /rebooted/)
 })
 
+test('regular firmware rejects attach immediately before FPS edits or source debugger startup', async () => {
+  const { createDeviceRelay } = await import('../src/device.mjs')
+  let snapshots = 0,
+    mutations = 0,
+    sourceStarts = 0
+  const serial = {
+    collect: async () => {
+      snapshots++
+      throw new Error('GEADEV:ERR unknown-command command=DEBUG')
+    },
+    command: async () => {
+      mutations++
+      throw new Error('Regular firmware must not receive debug mutations')
+    },
+  }
+  await assert.rejects(
+    createDeviceRelay({
+      serial,
+      debugFps: 10,
+      nativeDebug: {
+        get builds() {
+          sourceStarts++
+          throw new Error('Source debugger must not initialize against regular firmware')
+        },
+      },
+    }),
+    (error) => error.fatal === true && /--attach requires debug-enabled firmware/.test(error.message),
+  )
+  assert.equal(snapshots, 1)
+  assert.equal(mutations, 0)
+  assert.equal(sourceStarts, 0)
+})
+
+test('firmware without debugger framing requires a rebuild instead of startup retries', async () => {
+  let snapshots = 0
+  const transport = new DeviceTransport({
+    collect: async (line) => {
+      snapshots++
+      const snapshot = framed([{ id: 4, children: [] }], Number(line.split(' ').at(-1)))
+      snapshot.end = snapshot.end.replace(' boot=1', '')
+      return snapshot
+    },
+  })
+  await assert.rejects(
+    transport.snapshot(),
+    (error) => error.fatal === true && /Firmware lacks debugger framing/.test(error.message),
+  )
+  assert.equal(snapshots, 1)
+})
+
 test('device relay accepts Chrome startup request bursts without disconnecting', async () => {
   const { createDeviceRelay } = await import('../src/device.mjs')
   const { connectCDP } = await import('../src/cdp.mjs')

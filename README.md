@@ -36,7 +36,8 @@ gea run --debug --target macos
 The board command opens Chrome DevTools and a preview with **Device display**
 and **DOM mirror** modes. Select a node in Elements, edit its styles, or use
 the Console; edits reach the running board. Source breakpoints and stepping
-are available when the matching ESP32-S3 debug build and USB JTAG tools exist.
+are available with `--debug-sources` when the matching ESP32-S3 debug build and
+USB JTAG tools exist.
 
 The Mac command builds a native `.app`, launches its window and opens DevTools
 against its actual Gea tree. It requires a Mac, Apple command-line tools and
@@ -57,6 +58,11 @@ gea run --debug --attach --board amoled --debug-fps 10
 gea run --debug --target web
 ```
 
+`--attach` requires the running firmware to contain debug instrumentation; it
+cannot enable debugging in a regular build. The CLI validates the device's
+debugger protocol before starting JTAG tools or Chrome. Source debugging also
+requires local ELF/source metadata matching the running firmware.
+
 Board debugging opens a preview and a separate Chrome DevTools window. Keep them
 side by side. DevTools targets the board; inspecting the preview page itself only
 inspects the browser mirror. Ctrl-C closes the relay and its owned processes.
@@ -65,6 +71,7 @@ inspects the browser mirror. Ctrl-C closes the relay and its owned processes.
 | --- | --- |
 | `--debug-fps 10` | Cap board rendering; accepts 1–120 FPS. |
 | `--attach` | Reuse existing debug firmware and its matching build output. |
+| `--debug-sources` | Explicitly start ESP32-S3 USB JTAG for breakpoints and stepping. |
 | `--no-open` | Expose the debugger without opening Chrome. |
 | `--debug-port 9223` | Change the CDP and preview port. |
 
@@ -99,12 +106,12 @@ inspector uses JavaScriptCore. Selectors support tags, classes, IDs, `body` and 
 
 ## Source debugging
 
-ESP32-S3 debug builds expose original TS/TSX source maps, line/column hardware
-breakpoints, Pause/Resume and Step Over/Into/Out. ESP-IDF's OpenOCD and Xtensa GDB
-use built-in USB JTAG. The relay verifies that the ELF matches the running
+Add `--debug-sources` on ESP32-S3 debug builds for original TS/TSX source maps,
+line/column hardware breakpoints, Pause/Resume and Step Over/Into/Out.
+ESP-IDF's OpenOCD and Xtensa GDB use built-in USB JTAG. The relay verifies that the ELF matches the running
 firmware. Keep the matching build output when using `--attach`.
 Attach checks build folders in the app and its ancestor workspaces, selecting
-the ELF whose hash matches the running firmware. A missing-file warning refers
+the ELF whose hash matches the running firmware. A missing-file error refers
 to local build output; it does not determine whether firmware supports debugging.
 
 The chip has two hardware breakpoint slots. Stepping temporarily reserves a slot
@@ -114,7 +121,9 @@ Original variable names, JavaScript conditional breakpoints, exception pausing,
 live source replacement and macOS source stepping are not implemented. Pause
 preserves the last tree snapshot; resume before editing the tree or styles.
 
-Set `GEA_DEBUGGER_JTAG=0` for board tree/style inspection without source debugging.
+Tree/style inspection does not start OpenOCD/GDB by default. `--debug-sources`
+or `GEA_DEBUGGER_JTAG=1` opts into USB JTAG; `--no-debug-sources` overrides the
+environment. These options do not enable debugging in a regular firmware build.
 `GEA_GDB_BIN`, `GEA_OPENOCD_BIN` and `GEA_CHROME_PATH` override installed tools.
 `GEA_DEBUGGER_DIR` selects a debugger checkout for the Gea CLI.
 

@@ -80,8 +80,11 @@ export class DeviceTransport {
               return [n.id, n]
             }),
           )
-          if (!meta.boot)
-            throw new Error('Firmware lacks debugger framing; rebuild without --attach')
+          if (!meta.boot) {
+            const error = new Error('Firmware lacks debugger framing; rebuild without --attach')
+            error.fatal = true
+            throw error
+          }
           if (this.boot !== null && this.boot !== meta.boot) {
             const error = new Error('Device rebooted; reconnect to invalidate old node references')
             error.fatal = true
@@ -105,6 +108,14 @@ export class DeviceTransport {
           return snapshot
         } catch (error) {
           if (this.debuggerState?.paused && this.lastGood) return this.lastGood
+          if (error.message === 'GEADEV:ERR unknown-command command=DEBUG') {
+            const disabled = new Error(
+              '--attach requires debug-enabled firmware; this firmware has no debugger support. Build and flash with gea run --debug --board <board> (without --attach).',
+              { cause: error },
+            )
+            disabled.fatal = true
+            throw disabled
+          }
           if (error.fatal || this.serial.closed || this.serial.error) {
             error.fatal = true
             throw error
