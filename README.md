@@ -18,15 +18,42 @@ Native release binaries must be rebuilt with debug instrumentation.
 
 ## Run from your app directory
 
+### Same app on AMOLED 2.06 and native macOS
+
+Run both commands from the same Gea app folder, for example `bouncing-balls-jsx`
+or `tic-tac-toe`. No `--app` or `--project` arguments are needed.
+Register the connected Waveshare ESP32-S3 Touch AMOLED 2.06 with `gea setup`,
+choosing `amoled` as its board alias.
+
 ```sh
-# Build, flash and debug a registered board.
-gea run --debug --board my-board --debug-fps 10
+# Build, flash and run this app on the AMOLED board with DevTools.
+gea run --debug --board amoled --debug-fps 10
 
-# Reconnect to matching debug firmware without flashing.
-gea run --debug --attach --board my-board --debug-fps 10
-
-# Native macOS or the browser runtime.
+# Stop the board debugger with Ctrl-C, then compile and run the same app on Mac.
 gea run --debug --target macos
+```
+
+The board command opens Chrome DevTools and a preview with **Device display**
+and **DOM mirror** modes. Select a node in Elements, edit its styles, or use
+the Console; edits reach the running board. Source breakpoints and stepping
+are available when the matching ESP32-S3 debug build and USB JTAG tools exist.
+
+The Mac command builds a native `.app`, launches its window and opens DevTools
+against its actual Gea tree. It requires a Mac, Apple command-line tools and
+`@geastack/apple` installed in the app's dependency tree. A declared macOS target
+is not required for this debug build. Inspect nodes, edit inline styles and
+run Console scripts; macOS source stepping is not implemented.
+This compiled macOS backend hosts Gea's UI in AppKit. Direct UIKit/Apple-native
+widget trees are not supported by the debugger bridge.
+
+Run these sessions one at a time: they share the app's Chrome profile and use
+CDP port 9222 by default. To reconnect to the board or debug in the browser:
+
+```sh
+# Reconnect to matching debug firmware without flashing.
+gea run --debug --attach --board amoled --debug-fps 10
+
+# Run this app with browser DOM/CSS and Vite HMR.
 gea run --debug --target web
 ```
 
