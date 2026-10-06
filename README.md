@@ -12,8 +12,10 @@ npm install --save-dev @geastack/debugger
 ```
 
 Requires Node.js 22 or later and Chrome/Chromium. The commands below require a
-Gea CLI, compiler and target runtime with debugger support. Gea CLI `0.1.97`
-predates that integration; this package provides the adapters, not the toolchain.
+Gea CLI `0.1.98` or later, plus compiler and target runtimes with debugger
+support. The CLI installs this adapter package automatically. Native features
+require matching runtime/toolchain instrumentation; this package does not ship
+board firmware or compiler changes.
 Native release binaries must be rebuilt with debug instrumentation.
 
 ## Run from your app directory
