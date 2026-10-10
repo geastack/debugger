@@ -55,6 +55,9 @@ test(
       await cdp.send('CSS.enable')
       await cdp.send('Runtime.enable')
       assert.ok(events.some((event) => event.method === 'Runtime.executionContextCreated'))
+      const { cssLayoutViewport } = await cdp.send('Page.getLayoutMetrics')
+      assert.ok(cssLayoutViewport.clientWidth > 0 && cssLayoutViewport.clientHeight > 0,
+        'native viewport is available even when the window is inactive')
       const evaluate = async (expression) => {
         const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true })
         assert.equal(result.exceptionDetails, undefined, JSON.stringify(result))
@@ -87,8 +90,74 @@ test(
       )
       const { nodeId } = await cdp.send('DOM.querySelector', { nodeId: root.nodeId, selector })
       assert.ok(nodeId, `native app contains ${selector}`)
+      const shallow = await connectCDP(discovery[0].webSocketDebuggerUrl)
+      try {
+        const expanded = []
+        shallow.onEvent(event => expanded.push(event))
+        await shallow.send('DOM.enable')
+        await shallow.send('DOM.getDocument', { depth: 1 })
+        assert.deepEqual((await shallow.send('DOM.pushNodesByBackendIdsToFrontend', {
+          backendNodeIds: [nodeId],
+        })).nodeIds, [nodeId])
+        assert.ok(expanded.some(event => event.method === 'DOM.setChildNodes' &&
+          event.params.nodes.some(node => node.nodeId === nodeId)),
+          'backend selection publishes the path through a collapsed frontend tree')
+        await shallow.send('Overlay.enable')
+        await shallow.send('Overlay.setInspectMode', { mode: 'searchForNode' })
+        await shallow.send('Overlay.setInspectMode', { mode: 'none' })
+        await shallow.send('Overlay.setInspectMode', { mode: 'searchForNode' })
+      } finally { shallow.close() }
+      await delay(100)
       const matched = await cdp.send('CSS.getMatchedStylesForNode', { nodeId })
       assert.ok(matched.matchedCSSRules.length > 0, 'authored class CSS is exported')
+      const authored = (matched.matchedCSSRules.find(({ rule }) =>
+        rule.origin === 'regular' && rule.style.cssProperties.some(p => p.name === 'color'),
+      ) ?? matched.matchedCSSRules.find(({ rule }) => rule.origin === 'regular'))?.rule
+      assert.ok(authored, 'selected element has an editable author rule')
+      assert.equal(authored.styleSheetId, authored.style.styleSheetId)
+      assert.equal(authored.style.range.endColumn, authored.style.cssText.length)
+      assert.ok(authored.style.cssProperties.every(p => p.range))
+      assert.ok(events.some(e => e.method === 'CSS.styleSheetAdded' &&
+        e.params.header.styleSheetId === authored.styleSheetId && e.params.header.isMutable))
+      const colorDeclaration = authored.style.cssProperties.find(p => p.name === 'color')
+      const ruleEdit = await cdp.send('CSS.setStyleTexts', { edits: [{
+        styleSheetId: authored.styleSheetId,
+        range: colorDeclaration?.range ?? authored.style.range,
+        text: colorDeclaration ? 'color: rgb(255, 0, 255);'
+          : `${authored.style.cssText} color: rgb(255, 0, 255);`,
+      }] })
+      assert.equal(ruleEdit.styles[0].cssProperties.find(p => p.name === 'color').value, 'rgb(255, 0, 255)')
+      if (!matched.inlineStyle.cssProperties.some(p => p.name === 'color')) {
+        assert.equal(await evaluate(`getComputedStyle(document.querySelector(${JSON.stringify(selector)})).color`), 'rgb(255, 0, 255)')
+      }
+      assert.equal((await cdp.send('CSS.getInlineStylesForNode', { nodeId })).inlineStyle.cssText,
+        matched.inlineStyle.cssText, 'class editing does not create an inline override')
+      let authorStyle = ruleEdit.styles[0]
+      if (colorDeclaration) {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          let declaration = authorStyle.cssProperties.find(p => p.name === 'color')
+          authorStyle = (await cdp.send('CSS.setStyleTexts', { edits: [{
+            styleSheetId: authorStyle.styleSheetId, range: declaration.range,
+            text: '/* color: rgb(255, 0, 255); */',
+          }] })).styles[0]
+          await delay(100)
+          const fetched = (await cdp.send('CSS.getMatchedStylesForNode', { nodeId }))
+            .matchedCSSRules.find(({ rule }) => rule.styleSheetId === authored.styleSheetId).rule.style
+          assert.equal(fetched.cssProperties.find(p => p.name === 'color').disabled, true)
+          if (!matched.inlineStyle.cssProperties.some(p => p.name === 'color'))
+            assert.notEqual(await evaluate(`getComputedStyle(document.querySelector(${JSON.stringify(selector)})).color`), 'rgb(255, 0, 255)')
+          declaration = authorStyle.cssProperties.find(p => p.name === 'color')
+          authorStyle = (await cdp.send('CSS.setStyleTexts', { edits: [{
+            styleSheetId: authorStyle.styleSheetId, range: declaration.range,
+            text: 'color: rgb(255, 0, 255);',
+          }] })).styles[0]
+          assert.equal(authorStyle.cssProperties.find(p => p.name === 'color').disabled, false)
+        }
+      }
+      await cdp.send('CSS.setStyleTexts', { edits: [{
+        styleSheetId: authored.styleSheetId, range: authorStyle.range,
+        text: authored.style.cssText,
+      }] })
       const { object } = await cdp.send('DOM.resolveNode', { nodeId, objectGroup: 'test' })
       assert.equal(object.subtype, 'node')
       const call = await cdp.send('Runtime.callFunctionOn', {
@@ -133,6 +202,58 @@ test(
         ],
       })
       assert.equal(await evaluate('getComputedStyle($0).backgroundColor'), 'rgb(0, 0, 255)')
+      let editable = (await cdp.send('CSS.getInlineStylesForNode', { nodeId })).inlineStyle
+      editable = (await cdp.send('CSS.setStyleTexts', { edits: [{
+        styleSheetId: editable.styleSheetId, range: editable.range,
+        text: 'background: indianred;\ncolor: lime; opacity: .5;',
+      }] })).styles[0]
+      await delay(150)
+      const nativeIndianRed = await evaluate('getComputedStyle($0).backgroundColor')
+      assert.match(nativeIndianRed, /^rgb\(205, 9[23], 9[02]\)$/, 'native color quantization preserves indianred')
+      assert.deepEqual((await cdp.send('CSS.getInlineStylesForNode', { nodeId }))
+        .inlineStyle.cssProperties.map(p => p.name), ['background', 'color', 'opacity'],
+        'compiled background-color is never fabricated as an authored inline declaration')
+      const toggle = async (name, disabled) => {
+        const property = editable.cssProperties.find(p => p.name === name)
+        editable = (await cdp.send('CSS.setStyleTexts', { edits: [{
+          styleSheetId: editable.styleSheetId, range: property.range,
+          text: disabled ? `/* ${name}: ${property.value}; */` : `${name}: ${property.value};`,
+        }] })).styles[0]
+        assert.equal(editable.cssProperties.find(p => p.name === name).disabled, disabled)
+      }
+      for (let attempt = 0; attempt < 3; attempt++) {
+        await toggle('background', true)
+        await delay(100)
+        assert.notEqual(await evaluate('getComputedStyle($0).backgroundColor'), nativeIndianRed)
+        assert.equal(await evaluate('getComputedStyle($0).color'), 'rgb(0, 255, 0)')
+        await toggle('color', true)
+        await delay(100)
+        assert.notEqual(await evaluate('getComputedStyle($0).color'), 'rgb(0, 255, 0)')
+        assert.equal(editable.cssProperties.find(p => p.name === 'background').disabled, true)
+        await toggle('background', false)
+        await toggle('color', false)
+        await delay(100)
+        assert.equal(await evaluate('getComputedStyle($0).backgroundColor'), nativeIndianRed)
+        assert.equal(await evaluate('getComputedStyle($0).color'), 'rgb(0, 255, 0)')
+      }
+      await toggle('opacity', true)
+      cdp.close()
+      cdp = await connectCDP(discovery[0].webSocketDebuggerUrl)
+      cdp.onEvent((event) => events.push(event))
+      await cdp.send('DOM.enable')
+      await cdp.send('CSS.enable')
+      await cdp.send('Runtime.enable')
+      await cdp.send('DOM.getDocument', { depth: -1 })
+      await cdp.send('DOM.setInspectedNode', { nodeId })
+      editable = (await cdp.send('CSS.getInlineStylesForNode', { nodeId })).inlineStyle
+      assert.equal(editable.cssProperties.find(p => p.name === 'opacity').disabled, true,
+        'disabled declarations survive inspector reconnection')
+      assert.equal((await cdp.send('CSS.getStyleSheetText', { styleSheetId: editable.styleSheetId })).text,
+        editable.cssText)
+      await evaluate('$0.style.background = "blue"')
+      editable = (await cdp.send('CSS.getInlineStylesForNode', { nodeId })).inlineStyle
+      assert.deepEqual(editable.cssProperties.map(p => p.name), ['background', 'color', 'opacity'])
+      assert.equal(editable.cssProperties.find(p => p.name === 'opacity').disabled, true)
       await cdp.send('DOM.setAttributeValue', { nodeId, name: 'data-native-debug', value: 'live' })
       await delay(150)
       assert.ok(
@@ -163,6 +284,9 @@ test(
         await evaluate('document.querySelector(".debug-created").textContent'),
         'created live',
       )
+      assert.equal(await evaluate(`debugCreated.style.backgroundColor='red';
+        debugCreated.style.removeProperty('background-color'); getComputedStyle(debugCreated).backgroundColor`),
+        'rgba(0, 0, 0, 0)', 'removing the last longhand restores native transparency')
       await evaluate('debugCreated.remove()')
       await delay(100)
       assert.equal(await evaluate('document.querySelector(".debug-created")'), null)

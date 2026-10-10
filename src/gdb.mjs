@@ -321,6 +321,96 @@ export async function launchOpenOCD({ executable, serial, env = process.env }) {
   }
 }
 const list = (entries, key) => (Array.isArray(entries) ? entries.map((e) => e[key] || e) : [])
+// The compiled app as one script whose source map leads to the original
+// TS/TSX. Native line N is the operation emitted for a mapped source position.
+export function nativeScript(info, sources) {
+  return {
+    scriptId: 'native-app',
+    url: 'gea://native/' + info.file,
+    startLine: 0,
+    startColumn: 0,
+    endLine: sources.source.split('\n').length - 1,
+    endColumn: 0,
+    executionContextId: 1,
+    hash: createHash('sha256').update(sources.source).digest('hex'),
+    sourceMapURL:
+      'data:application/json;base64,' + Buffer.from(JSON.stringify(sources.map)).toString('base64'),
+    hasSourceURL: true,
+    isLiveEdit: false,
+    scriptLanguage: 'JavaScript',
+    length: sources.source.length,
+  }
+}
+
+// Sources without USB JTAG: DevTools can read the original TS/TSX and follow
+// links into it (Event Listeners), but cannot pause or set breakpoints.
+export class StaticSources {
+  constructor(info) {
+    this.info = info
+    this.sources = nativeSources(info)
+    this.paused = false
+  }
+  detach() {}
+  async close() {}
+  async handle(owner, emit, method, p = {}) {
+    if (method === 'Debugger.enable') {
+      emit('Debugger.scriptParsed', nativeScript(this.info, this.sources))
+      return { debuggerId: 'gea-native-sources' }
+    }
+    if (method === 'Debugger.getScriptSource') {
+      if (p.scriptId !== 'native-app') throw new Error('Unknown native script')
+      return { scriptSource: this.sources.source }
+    }
+    if (method === 'Debugger.getPossibleBreakpoints') return { locations: [] }
+    if (['Debugger.setBreakpoint', 'Debugger.setBreakpointByUrl', 'Debugger.pause'].includes(method))
+      throw new Error('Breakpoints and pausing need USB JTAG; relaunch with --debug-sources on ESP32-S3')
+    if (method.startsWith('Debugger.')) return {}
+    return undefined
+  }
+}
+
+// Maps firmware code addresses to source lines from the ELF alone. It never
+// connects to the target, so lookups work with or without JTAG and never
+// stop the running app.
+export class ElfLines {
+  constructor(executable, elf, info, { env = process.env } = {}) {
+    this.executable = executable
+    this.elf = elf
+    this.info = info
+    this.env = env
+    this.cache = new Map()
+  }
+  async lookup(address) {
+    this.mi ||= new GdbMI(this.executable, this.elf, { env: this.env })
+    const hex = '0x' + address.toString(16)
+    const r = await this.mi.command(`-data-disassemble -s ${hex} -e 0x${(address + 1).toString(16)} -- 1`)
+    const first = (r.asm_insns || [])[0]
+    const entry = first?.src_and_asm_line || first
+    const instruction = entry?.line_asm_insn?.[0] || entry
+    const functionName = instruction?.['func-name'] || ''
+    if (!entry?.line || path.basename(entry.file || '') !== this.info.file) return { functionName }
+    return {
+      scriptId: 'native-app',
+      lineNumber: Math.max(0, Number(entry.line) - 1),
+      columnNumber: 0,
+      functionName,
+    }
+  }
+  // {address: location}; unmapped addresses carry only their function name.
+  async locations(addresses) {
+    const result = {}
+    for (const address of new Set(addresses).values()) {
+      if (!Number.isInteger(address) || address <= 0) continue
+      if (!this.cache.has(address)) this.cache.set(address, await this.lookup(address).catch(() => ({})))
+      result[address] = this.cache.get(address)
+    }
+    return result
+  }
+  async close() {
+    await this.mi?.close()
+  }
+}
+
 export class NativeDebugger {
   constructor(mi, info) {
     this.mi = mi
@@ -411,23 +501,7 @@ export class NativeDebugger {
     this.paused = false
   }
   script() {
-    return {
-      scriptId: 'native-app',
-      url: 'gea://native/' + this.info.file,
-      startLine: 0,
-      startColumn: 0,
-      endLine: this.sources.source.split('\n').length - 1,
-      endColumn: 0,
-      executionContextId: 1,
-      hash: createHash('sha256').update(this.sources.source).digest('hex'),
-      sourceMapURL:
-        'data:application/json;base64,' +
-        Buffer.from(JSON.stringify(this.sources.map)).toString('base64'),
-      hasSourceURL: true,
-      isLiveEdit: false,
-      scriptLanguage: 'JavaScript',
-      length: this.sources.source.length,
-    }
+    return nativeScript(this.info, this.sources)
   }
   attach(owner, emit) {
     this.clients.set(owner, emit)

@@ -5,8 +5,11 @@
 #include "ui/node.h"
 #include "ui/tree_internal.h"
 #include "ui/tree_state.h"
+#include "ui/style_values.h"
+#include "gea_debugger_css.h"
 #import <Cocoa/Cocoa.h>
 #import <JavaScriptCore/JavaScriptCore.h>
+#include "macos-picker.h"
 #include <cerrno>
 #include <cmath>
 #include <cstring>
@@ -15,9 +18,11 @@
 #include <string>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 extern "C" void gea_macos_fire_press_for_node(int nodeId);
+namespace gea::macos { int nodeIdForView(NSView *view); }
 using namespace gea::embedded::ui;
 
 namespace {
@@ -45,6 +50,17 @@ template <typename F> void scriptCallVoid(JSContext *context, F &&action) {
 NSString *str(const char *value) { return [NSString stringWithUTF8String:value ?: ""] ?: @""; }
 NSString *px(int value) { return [NSString stringWithFormat:@"%dpx", value]; }
 NSNumber *nodeId(int slot) { return @(Tree::instance().node(slot).debugger_identity * 2 + 2); }
+// JSX listeners are delegated to the body, so the engine's listener table
+// cannot name their element. The runtime's GEA_JSX_NODE_LISTENER_HOOK reports
+// each registration here, keyed by lifetime identity, with its callers.
+struct DebugListener {
+    std::string type;
+    std::vector<uintptr_t> sites;
+};
+std::unordered_map<int, std::vector<DebugListener>> &debugListeners() {
+    static std::unordered_map<int, std::vector<DebugListener>> listeners;
+    return listeners;
+}
 NSString *color(style_color_t value) {
 #if GEA_EMBEDDED_PIXEL_FORMAT == GEA_PIXEL_RGBA8888
     int r = value & 255, g = (value >> 8) & 255, b = (value >> 16) & 255;
@@ -91,6 +107,12 @@ NSDictionary *computed(int slot) {
     }
     return d;
 }
+NSString *ruleSheetId(NSString *selector, NSString *media, BOOL userAgent) {
+    NSData *identity = [NSJSONSerialization dataWithJSONObject:@[ selector, media, @(userAgent) ] options:0 error:nil];
+    NSString *encoded = [identity base64EncodedStringWithOptions:0];
+    encoded = [[encoded stringByReplacingOccurrencesOfString:@"+" withString:@"-"] stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+    return [@"rule-" stringByAppendingString:[encoded stringByReplacingOccurrencesOfString:@"=" withString:@""]];
+}
 NSDictionary *attributes(int slot) {
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
     const auto *rd = rareDataFor(slot);
@@ -135,6 +157,25 @@ NSDictionary *frameInfo() {
 }
 } // namespace
 
+extern "C" void gea_debugger_note_listener(int slot, const char *type, void *const *sites, int count) {
+    if (slot < 0 || slot >= Tree::instance().nodeCount() || !type || !*type || count < 0)
+        return;
+    std::vector<uintptr_t> callers;
+    for (int i = 0; i < count && i < 8 && sites[i]; ++i)
+        callers.push_back(reinterpret_cast<uintptr_t>(sites[i]));
+    auto &list = debugListeners()[nodeId(slot).intValue];
+    for (const auto &listener : list)
+        if (listener.type == type && listener.sites == callers)
+            return;
+    list.push_back({type, callers});
+}
+NSArray *listenerSites(const DebugListener &listener) {
+    NSMutableArray *sites = [NSMutableArray array];
+    for (uintptr_t site : listener.sites)
+        [sites addObject:[NSString stringWithFormat:@"0x%llx", (unsigned long long)site]];
+    return sites;
+}
+
 @interface GeaDebugOverlay : NSView
 @end
 @implementation GeaDebugOverlay
@@ -151,8 +192,9 @@ NSDictionary *frameInfo() {
 }
 @end
 static GeaDebugOverlay *debugOverlay;
+static GeaDebugPicker *debugPicker;
 
-@interface GeaDebugSession : NSObject
+@interface GeaDebugSession : NSObject <GeaDebugPickerDelegate>
 @property int fd;
 @property NSMutableData *input;
 @property NSMutableData *output;
@@ -168,6 +210,8 @@ static GeaDebugOverlay *debugOverlay;
 @property NSMutableSet<NSNumber *> *knownNodes;
 @property NSMutableSet<NSNumber *> *publishedChildren;
 @property NSMutableSet<NSString *> *announcedStyles;
+@property NSMutableDictionary<NSString *, NSDictionary *> *ruleSheets;
+@property NSNumber *pickerHoverNode;
 - (void)poll;
 - (NSDictionary *)snapshot;
 - (int)slot:(NSNumber *)id;
@@ -175,9 +219,17 @@ static GeaDebugOverlay *debugOverlay;
 - (NSDictionary *)remote:(JSValue *)value byValue:(BOOL)byValue group:(NSString *)group;
 - (NSDictionary *)evaluation:(JSValue *)value params:(NSDictionary *)params;
 - (NSDictionary *)inlineStyle:(NSNumber *)id;
+- (NSDictionary *)cssStyle:(NSString *)text sheet:(NSString *)sheet owner:(NSNumber *)owner userAgent:(BOOL)userAgent;
+- (void)refreshRuleSheets;
 - (NSDictionary *)inlineValues:(NSNumber *)id;
+- (NSDictionary *)inlineProjection:(NSNumber *)id;
+- (NSString *)inlineText:(NSNumber *)id;
+- (id)cssCall:(NSString *)name arguments:(NSArray *)arguments;
 - (void)setStyleText:(NSString *)text node:(NSNumber *)id;
 - (void)publishChanges;
+- (void)publishPath:(NSNumber *)id;
+- (void)highlight:(NSNumber *)id;
+- (NSNumber *)pickerNode:(NSPoint)point inView:(NSView *)view;
 - (void)send:(NSDictionary *)value;
 - (void)emit:(NSString *)method params:(NSDictionary *)params;
 - (id)handle:(NSString *)method params:(NSDictionary *)params;
@@ -185,7 +237,8 @@ static GeaDebugOverlay *debugOverlay;
 
 // CSS declarations authored through DevTools are shared between connections.
 // Actual computed values always come back from the engine's cascade.
-static NSMutableDictionary<NSNumber *, NSMutableDictionary<NSString *, NSString *> *> *debugStyles;
+static NSMutableDictionary<NSNumber *, NSDictionary *> *debugStyles;
+static NSMutableDictionary<NSString *, NSDictionary *> *debugRuleStyles;
 
 @implementation GeaDebugSession
 - (instancetype)init {
@@ -199,9 +252,11 @@ static NSMutableDictionary<NSNumber *, NSMutableDictionary<NSString *, NSString 
     self.knownNodes = [NSMutableSet set];
     self.publishedChildren = [NSMutableSet set];
     self.announcedStyles = [NSMutableSet set];
+    self.ruleSheets = [NSMutableDictionary dictionary];
     self.objects = [NSMutableDictionary dictionary];
     self.groups = [NSMutableDictionary dictionary];
     self.context = [[JSContext alloc] init];
+    [self.context evaluateScript:str(geaDebuggerCss)];
     __weak GeaDebugSession *weak = self;
     self.context[@"__geaQuery"] = ^NSArray *(NSString *selector) {
       return scriptCall<NSArray *>(
@@ -307,6 +362,8 @@ static NSMutableDictionary<NSNumber *, NSMutableDictionary<NSString *, NSString 
                   return computed(slot);
               if ([key isEqual:@"inline"])
                   return [session inlineValues:id];
+              if ([key isEqual:@"styleText"])
+                  return [session inlineText:id];
               if ([key isEqual:@"parent"])
                   return n.parent >= 0 && session.slots[nodeId(n.parent)] ? nodeId(n.parent)
                                                                           : NSNull.null;
@@ -315,6 +372,17 @@ static NSMutableDictionary<NSNumber *, NSMutableDictionary<NSString *, NSString 
                   for (int child = n.first_child; child >= 0; child = tree.node(child).next_sibling)
                       [ids addObject:nodeId(child)];
                   return ids;
+              }
+              if ([key isEqual:@"listeners"]) {
+                  NSMutableArray *listeners = [NSMutableArray array];
+                  auto found = debugListeners().find(id.intValue);
+                  if (found != debugListeners().end())
+                      for (const auto &listener : found->second)
+                          [listeners addObject:@{
+                              @"type" : str(listener.type.c_str()),
+                              @"callers" : listenerSites(listener)
+                          }];
+                  return listeners;
               }
               if ([key isEqual:@"rect"])
                   return @{
@@ -338,20 +406,10 @@ static NSMutableDictionary<NSNumber *, NSMutableDictionary<NSString *, NSString 
               int slot = [session slot:id];
               auto &tree = Tree::instance();
               if ([operation isEqual:@"style"]) {
-                  if (!debugStyles[id])
-                      debugStyles[id] = [NSMutableDictionary dictionary];
-                  if (value.length) {
-                      gea::embedded::ui::Style(slot).setProperty(std::string(key.UTF8String),
-                                                                 std::string(value.UTF8String));
-                      debugStyles[id][key] = value;
-                  } else {
-                      gea::embedded::ui::Style(slot).removeProperty(std::string(key.UTF8String));
-                      [debugStyles[id] removeObjectForKey:key];
-                  }
-                  if (session.cssEnabled)
-                      [session
-                            emit:@"CSS.styleSheetChanged"
-                          params:@{@"styleSheetId" : [NSString stringWithFormat:@"inline-%@", id]}];
+                  NSString *text = [session cssCall:@"setCssProperty" arguments:@[ [session inlineText:id], key, value ]];
+                  [session setStyleText:text node:id];
+              } else if ([operation isEqual:@"styleText"]) {
+                  [session setStyleText:value node:id];
               } else if ([operation isEqual:@"attribute"])
                   tree.setAttribute(slot, key.UTF8String, value.UTF8String);
               else if ([operation isEqual:@"removeAttribute"])
@@ -385,6 +443,20 @@ static NSMutableDictionary<NSNumber *, NSMutableDictionary<NSString *, NSString 
               return NSNull.null;
           },
           NSNull.null);
+    };
+    // inspect(node) reveals the node in Elements, as in Chrome.
+    self.context[@"__geaInspect"] = ^(JSValue *node) {
+      scriptCallVoid(JSContext.currentContext, [&]() {
+          GeaDebugSession *session = weak;
+          if (!session.runtimeEnabled)
+              return;
+          [session emit:@"Runtime.inspectRequested"
+                 params:@{
+                     @"object" : [session remote:node byValue:NO group:@"console"],
+                     @"hints" : @{},
+                     @"executionContextId" : @1
+                 }];
+      });
     };
     self.context[@"__geaLog"] = ^(NSString *type, JSValue *args) {
       scriptCallVoid(JSContext.currentContext, [&]() {
@@ -427,8 +499,8 @@ function __geaNode(id) {
     removeProperty: key => write('style', key),
     getPropertyValue: key => read('inline')[key] || ''
   }, {
-    get(t, key) { if (key in t) return t[key]; if (key === 'cssText') return Object.entries(read('inline')).map(([k,v]) => k+': '+v+';').join(' '); return read('inline')[__kebab(key)] || ''; },
-    set(t, key, value) { if (key === 'cssText') { for (const k of Object.keys(read('inline'))) write('style', k); for (const part of String(value).split(';')) { const i=part.indexOf(':'); if(i>0) write('style',part.slice(0,i).trim(),part.slice(i+1).trim()); } } else write('style', __kebab(key), value); return true; }
+    get(t, key) { if (key in t) return t[key]; if (key === 'cssText') return read('styleText'); return read('inline')[__kebab(key)] || ''; },
+    set(t, key, value) { if (key === 'cssText') write('styleText', '', value); else write('style', __kebab(key), value); return true; }
   });
   const node = {
     __geaNodeId: id, nodeType: 1, style,
@@ -466,6 +538,16 @@ const getComputedStyle = node => {
   const d = __geaRead(node.__geaNodeId,'computed');
   return new Proxy({...d,getPropertyValue:k=>d[k]||''}, {get:(t,k)=>t[k]??d[__kebab(k)]??''});
 };
+// Native registrations grouped like Chrome's getEventListeners(); the
+// listener values are metadata, not invocable JavaScript callbacks.
+const getEventListeners = node => {
+  const groups = {};
+  for (const info of __geaRead(node.__geaNodeId, 'listeners'))
+    (groups[info.type] ||= []).push({ type: info.type, listener: Object.freeze({ ...info, node: node.tagName.toLowerCase() }),
+      useCapture: false, passive: false, once: false });
+  return groups;
+};
+const inspect = node => { __geaInspect(node); };
 const console = Object.fromEntries(['log','info','warn','error','debug'].map(t=>[t,(...a)=>__geaLog(t==='warn'?'warning':t,a)]));
 )JS"];
     return self;
@@ -489,6 +571,60 @@ const console = Object.fromEntries(['log','info','warn','error','debug'].map(t=>
 }
 - (void)emit:(NSString *)method params:(NSDictionary *)params {
     [self send:@{@"method" : method, @"params" : params}];
+}
+- (void)publishPath:(NSNumber *)id {
+    [self publishChildren:@1 depth:1];
+    [self publishChildren:@2 depth:1];
+    NSMutableArray *path = [NSMutableArray array];
+    const int slot = [self slot:@(id.intValue & ~1)];
+    for (int parent = Tree::instance().node(slot).parent; parent >= 0;
+         parent = Tree::instance().node(parent).parent)
+        if (self.slots[nodeId(parent)]) [path addObject:nodeId(parent)];
+    for (NSNumber *parent in path.reverseObjectEnumerator) [self publishChildren:parent depth:1];
+    if (id.intValue & 1) [self publishChildren:@(id.intValue - 1) depth:1];
+}
+- (void)highlight:(NSNumber *)id {
+    const auto &n = Tree::instance().node([self slot:id]);
+    NSView *parent = NSApp.mainWindow.contentView ?: NSApp.windows.firstObject.contentView;
+    if (!debugOverlay) debugOverlay = [[GeaDebugOverlay alloc] init];
+    [debugOverlay removeFromSuperview];
+    debugOverlay.frame = NSMakeRect(n.layout.x,
+        parent.isFlipped ? n.layout.y : parent.bounds.size.height - n.layout.y - n.layout.height,
+        n.layout.width, n.layout.height);
+    [parent addSubview:debugOverlay positioned:NSWindowAbove relativeTo:nil];
+    [debugOverlay setNeedsDisplay:YES];
+}
+- (NSNumber *)pickerNode:(NSPoint)point inView:(NSView *)view {
+    [self snapshot];
+    NSView *hit = [view hitTest:[view convertPoint:point toView:view.superview]];
+    int slot = gea::macos::nodeIdForView(hit);
+    if (slot < 0) slot = Tree::instance().hitTestNode(std::floor(point.x),
+        std::floor(view.isFlipped ? point.y : view.bounds.size.height - point.y));
+    if (slot < 0 || slot >= treeState().nodeCount || !treeState().nodeActive[slot]) return nil;
+    NSNumber *id = nodeId(slot);
+    return self.slots[id] ? id : nil;
+}
+- (void)pickerHover:(NSPoint)point inView:(NSView *)view {
+    NSNumber *id = [self pickerNode:point inView:view];
+    if (!id) { [debugOverlay removeFromSuperview]; self.pickerHoverNode = nil; return; }
+    [self highlight:id];
+    if ([id isEqual:self.pickerHoverNode]) return;
+    self.pickerHoverNode = id;
+    [self publishPath:id];
+    [self emit:@"Overlay.nodeHighlightRequested" params:@{@"nodeId":id}];
+}
+- (void)pickerSelect:(NSPoint)point inView:(NSView *)view {
+    self.pickerHoverNode = nil;
+    [debugOverlay removeFromSuperview];
+    NSNumber *id = [self pickerNode:point inView:view];
+    if (!id) { [self pickerCanceled]; return; }
+    [self publishPath:id];
+    [self emit:@"Overlay.inspectNodeRequested" params:@{@"backendNodeId":id}];
+}
+- (void)pickerCanceled {
+    self.pickerHoverNode = nil;
+    [debugOverlay removeFromSuperview];
+    if (self.fd >= 0) [self emit:@"Overlay.inspectModeCanceled" params:@{}];
 }
 - (NSDictionary *)snapshot {
     NSMutableDictionary *snapshot = [NSMutableDictionary dictionary];
@@ -683,6 +819,11 @@ const console = Object.fromEntries(['log','info','warn','error','debug'].map(t=>
     if (![value[@"__geaNodeId"] isUndefined]) {
         remote[@"subtype"] = @"node";
         remote[@"className"] = @"GeaElement";
+        // Chrome labels element objects as tag#id.class, not "[object Object]".
+        remote[@"description"] = [[self.context evaluateScript:
+            @"(node => node.nodeType === 3 ? '#text' : node.tagName.toLowerCase() + (node.id ? '#' + node.id : '') + "
+             "(node.className ? '.' + node.className.trim().split(/\\s+/).join('.') : ''))"]
+            callWithArguments:@[ value ]].toString ?: @"node";
     } else if (value.isArray) {
         remote[@"subtype"] = @"array";
         remote[@"className"] = @"Array";
@@ -716,11 +857,10 @@ const console = Object.fromEntries(['log','info','warn','error','debug'].map(t=>
                            group:params[@"objectGroup"]]
     };
 }
-- (NSDictionary *)inlineValues:(NSNumber *)id {
+- (NSDictionary *)inlineProjection:(NSNumber *)id {
     int slot = [self slot:id];
-    NSMutableDictionary *values = [debugStyles[id] mutableCopy] ?: [NSMutableDictionary dictionary];
+    NSMutableDictionary *values = [NSMutableDictionary dictionary];
     const auto *rare = rareDataFor(slot);
-    const NSDictionary *used = computed(slot);
     if (rare)
         for (std::size_t i = 0; i < rare->inlineStyles.size(); ++i) {
             const auto &entry = rare->inlineStyles.at(i);
@@ -812,79 +952,94 @@ const console = Object.fromEntries(['log','info','warn','error','debug'].map(t=>
                 values[name] = rare->inlineStyles.getCssPixels(entry.property, pixels)
                                    ? [NSString stringWithFormat:@"%.5gpx", pixels]
                                    : px(entry.value);
-            } else if (used[name])
-                values[name] = used[name];
+            } else if (entry.property == Property::Color || entry.property == Property::BackgroundColor)
+                values[name] = color(StyleValues::pixelFromStyleValue(entry.value));
+            else if (entry.property == Property::Opacity)
+                values[name] = [NSString stringWithFormat:@"%.4g", entry.value / 255.0];
+            else if (entry.property == Property::Display)
+                values[name] = entry.value == kDisplayNone ? @"none" : entry.value == kDisplayFlex ? @"flex" : entry.value == kDisplayGrid ? @"grid" : @"block";
+            else if (entry.property == Property::Position)
+                values[name] = entry.value == 1 ? @"absolute" : entry.value == 2 ? @"relative" : entry.value == 3 ? @"fixed" : @"static";
         }
     return values;
 }
-- (NSDictionary *)inlineStyle:(NSNumber *)id {
-    [self slot:id];
-    NSDictionary *values = [self inlineValues:id];
-    NSMutableArray *properties = [NSMutableArray array];
-    NSMutableString *text = [NSMutableString string];
-    for (NSString *name in [[values allKeys] sortedArrayUsingSelector:@selector(compare:)]) {
-        NSUInteger start = text.length;
-        NSString *declaration = [NSString stringWithFormat:@"%@: %@;", name, values[name]];
-        [text appendString:declaration];
-        [properties addObject:@{
-            @"name" : name,
-            @"value" : values[name],
-            @"important" : @NO,
-            @"implicit" : @NO,
-            @"parsedOk" : @YES,
-            @"disabled" : @NO,
-            @"text" : declaration,
-            @"range" : @{
-                @"startLine" : @0,
-                @"startColumn" : @(start),
-                @"endLine" : @0,
-                @"endColumn" : @(text.length)
-            }
-        }];
-        [text appendString:@" "];
+- (id)cssCall:(NSString *)name arguments:(NSArray *)arguments {
+    JSValue *result = [self.context[@"__geaCSS"][name] callWithArguments:arguments];
+    if (self.context.exception) {
+        NSString *reason = [self.context.exception toString];
+        self.context.exception = nil;
+        @throw [NSException exceptionWithName:@"CDP" reason:reason userInfo:nil];
     }
-    NSString *sheetId = [NSString stringWithFormat:@"inline-%@", id];
+    return [result toObject];
+}
+- (NSString *)inlineText:(NSNumber *)id {
+    NSDictionary *document = [self cssCall:@"reconcileCss" arguments:@[ debugStyles[id] ?: NSNull.null, [self inlineProjection:id] ]];
+    debugStyles[id] = document;
+    return document[@"text"];
+}
+- (NSDictionary *)inlineValues:(NSNumber *)id {
+    return [self cssCall:@"cssValues" arguments:@[ [self inlineText:id] ]];
+}
+- (NSDictionary *)cssStyle:(NSString *)text sheet:(NSString *)sheetId owner:(NSNumber *)owner userAgent:(BOOL)userAgent {
+    NSDictionary *style = [self cssCall:@"cssStyle" arguments:@[ text, sheetId ]];
     if (self.cssEnabled && ![self.announcedStyles containsObject:sheetId]) {
         [self.announcedStyles addObject:sheetId];
-        [self emit:@"CSS.styleSheetAdded"
-            params:@{
-                @"header" : @{
+        NSMutableDictionary *header = [@{
                     @"styleSheetId" : sheetId,
                     @"frameId" : @"gea",
                     @"sourceURL" : @"",
-                    @"origin" : @"regular",
+                    @"origin" : userAgent ? @"user-agent" : @"regular",
                     @"title" : @"",
-                    @"ownerNode" : id,
                     @"disabled" : @NO,
                     @"isInline" : @YES,
-                    @"isMutable" : @YES,
+                    @"isMutable" : @(!userAgent),
                     @"isConstructed" : @NO,
                     @"startLine" : @0,
                     @"startColumn" : @0,
                     @"length" : @(text.length),
-                    @"endLine" : @0,
-                    @"endColumn" : @(text.length)
-                }
-            }];
+                    @"endLine" : style[@"range"][@"endLine"],
+                    @"endColumn" : style[@"range"][@"endColumn"]
+        } mutableCopy];
+        if (owner) header[@"ownerNode"] = owner;
+        [self emit:@"CSS.styleSheetAdded" params:@{@"header":header}];
     }
-    return @{
-        @"styleSheetId" : sheetId,
-        @"cssProperties" : properties,
-        @"shorthandEntries" : @[],
-        @"cssText" : text,
-        @"range" : @{
-            @"startLine" : @0,
-            @"startColumn" : @0,
-            @"endLine" : @0,
-            @"endColumn" : @(text.length)
+    return style;
+}
+- (NSDictionary *)inlineStyle:(NSNumber *)id {
+    [self slot:id];
+    return [self cssStyle:[self inlineText:id] sheet:[NSString stringWithFormat:@"inline-%@", id] owner:id userAgent:NO];
+}
+- (void)refreshRuleSheets {
+    NSMutableDictionary<NSString *, NSMutableDictionary *> *sheets = [NSMutableDictionary dictionary];
+    for (const auto &rule : debuggerCssRules()) {
+        NSString *selector = str(rule.selector.c_str()), *media = str(rule.media.c_str());
+        NSString *id = ruleSheetId(selector, media, rule.userAgent);
+        NSMutableDictionary *sheet = sheets[id];
+        if (!sheet) {
+            sheet = [@{@"selector":selector, @"media":media, @"userAgent":@(rule.userAgent), @"values":[NSMutableDictionary dictionary]} mutableCopy];
+            sheets[id] = sheet;
         }
-    };
+        if (!rule.property.empty()) sheet[@"values"][str(rule.property.c_str())] = str(rule.value.c_str());
+    }
+    for (NSString *id in sheets) {
+        NSDictionary *document = [self cssCall:@"reconcileCss" arguments:@[ debugRuleStyles[id] ?: NSNull.null, sheets[id][@"values"] ]];
+        debugRuleStyles[id] = document;
+        sheets[id][@"text"] = document[@"text"];
+    }
+    self.ruleSheets = [sheets mutableCopy];
+    if (self.cssEnabled)
+        for (NSString *id in sheets) [self cssStyle:sheets[id][@"text"] sheet:id owner:nil userAgent:[sheets[id][@"userAgent"] boolValue]];
 }
 - (void)setStyleText:(NSString *)text node:(NSNumber *)id {
-    [self slot:id];
-    // Let the JS style wrapper handle mutation through the same engine parser.
-    JSValue *node = [self.context[@"__geaNode"] callWithArguments:@[ id ]];
-    node[@"style"][@"cssText"] = text;
+    int slot = [self slot:id];
+    NSString *previous = [self inlineText:id];
+    NSArray *operations = [self cssCall:@"cssMutations" arguments:@[ previous, [self inlineProjection:id], text ]];
+    for (NSDictionary *operation in operations) {
+        std::string key = [operation[@"key"] UTF8String], value = [operation[@"value"] UTF8String];
+        if (value.empty()) gea::embedded::ui::Style(slot).removeProperty(key);
+        else gea::embedded::ui::Style(slot).setProperty(key, value);
+    }
+    debugStyles[id] = @{@"text":text, @"projection":[self inlineProjection:id]};
 }
 - (id)handle:(NSString *)method params:(NSDictionary *)p {
     [self snapshot];
@@ -898,6 +1053,7 @@ const console = Object.fromEntries(['log','info','warn','error','debug'].map(t=>
     }
     if ([method isEqual:@"CSS.enable"]) {
         self.cssEnabled = YES;
+        [self refreshRuleSheets];
         return @{};
     }
     if ([method isEqual:@"CSS.disable"]) {
@@ -1023,6 +1179,7 @@ const console = Object.fromEntries(['log','info','warn','error','debug'].map(t=>
         NSMutableArray *ids = [NSMutableArray array];
         for (NSNumber *id in p[@"backendNodeIds"]) {
             [self slot:@(id.intValue & ~1)];
+            [self publishPath:id];
             [ids addObject:id];
         }
         return @{@"nodeIds" : ids};
@@ -1032,6 +1189,69 @@ const console = Object.fromEntries(['log','info','warn','error','debug'].map(t=>
         self.context[@"__geaSelectedId"] = p[@"nodeId"];
         [self.context evaluateScript:@"$0 = __geaNode(__geaSelectedId)"];
         return @{};
+    }
+    if ([method isEqual:@"DOMDebugger.getEventListeners"]) {
+        JSValue *object = self.objects[p[@"objectId"]];
+        if (!object || [object[@"__geaNodeId"] isUndefined])
+            @throw [NSException exceptionWithName:@"CDP" reason:@"Object is not a native node" userInfo:nil];
+        const int depth = p[@"depth"] ? [p[@"depth"] intValue] : 1;
+        if (depth < -1)
+            @throw [NSException exceptionWithName:@"CDP" reason:@"Invalid event listener depth" userInfo:nil];
+        int root = [self slot:@([[object[@"__geaNodeId"] toNumber] intValue] & ~1)];
+        // Drop registrations of nodes that no longer exist before reporting.
+        std::unordered_map<int, bool> alive;
+        for (int i = 0; i < treeState().nodeCount; ++i)
+            if (treeState().nodeActive[i]) alive[nodeId(i).intValue] = true;
+        for (auto it = debugListeners().begin(); it != debugListeners().end();)
+            it = alive.count(it->first) ? std::next(it) : debugListeners().erase(it);
+        NSMutableArray *listeners = [NSMutableArray array];
+        auto &tree = Tree::instance();
+        std::vector<std::pair<int, int>> pending{{root, depth}};
+        while (!pending.empty() && listeners.count < 4096) {
+            auto [slot, remaining] = pending.back();
+            pending.pop_back();
+            NSNumber *id = nodeId(slot);
+            auto found = debugListeners().find(id.intValue);
+            if (found != debugListeners().end())
+                for (const auto &listener : found->second) {
+                    NSString *type = str(listener.type.c_str());
+                    NSArray *sites = listenerSites(listener);
+                    JSValue *metadata = [self.context evaluateScript:@"(type, node, callers) => Object.freeze({ type, node, callers: callers.join(' ← ') })"];
+                    JSValue *value = [metadata callWithArguments:@[ type, tag(slot), sites ]];
+                    NSString *objectId = [NSString stringWithFormat:@"gea-listener-%u", ++self.objectSequence];
+                    self.objects[objectId] = value;
+                    NSString *group = p[@"objectGroup"] ?: @"event-listeners";
+                    if (!self.groups[group]) self.groups[group] = [NSMutableSet set];
+                    [self.groups[group] addObject:objectId];
+                    NSDictionary *handler = @{
+                        @"type" : @"function",
+                        @"className" : @"GeaListener",
+                        @"description" : [NSString stringWithFormat:@"%@ listener on <%@>", type, tag(slot)],
+                        @"objectId" : objectId
+                    };
+                    [listeners addObject:@{
+                        @"type" : type,
+                        @"useCapture" : @NO,
+                        @"passive" : @NO,
+                        @"once" : @NO,
+                        @"scriptId" : @"",
+                        @"lineNumber" : @0,
+                        @"columnNumber" : @0,
+                        @"handler" : handler,
+                        @"originalHandler" : handler,
+                        @"backendNodeId" : id,
+                        @"nativeAddresses" : sites
+                    }];
+                }
+            if (remaining == -1 || remaining > 1) {
+                std::vector<int> children;
+                for (int child = tree.node(slot).first_child; child >= 0; child = tree.node(child).next_sibling)
+                    children.push_back(child);
+                for (auto child = children.rbegin(); child != children.rend(); ++child)
+                    pending.push_back({*child, remaining == -1 ? -1 : remaining - 1});
+            }
+        }
+        return @{@"listeners" : listeners};
     }
     if ([method isEqual:@"DOM.getBoxModel"] || [method isEqual:@"DOM.getContentQuads"]) {
         int slot = [self slot:p[@"nodeId"] ?: p[@"backendNodeId"]];
@@ -1061,9 +1281,32 @@ const console = Object.fromEntries(['log','info','warn','error','debug'].map(t=>
             }
         };
     }
+    if ([method isEqual:@"Overlay.setInspectMode"]) {
+        NSString *mode = p[@"mode"];
+        if ([mode isEqual:@"none"]) {
+            if (debugPicker.delegate == self) {
+                [debugPicker stop];
+                [debugOverlay removeFromSuperview];
+                self.pickerHoverNode = nil;
+            }
+            return @{};
+        }
+        if (![mode isEqual:@"searchForNode"] && ![mode isEqual:@"searchForUAShadowDOM"])
+            @throw [NSException exceptionWithName:@"CDP" reason:@"Unsupported native inspect mode" userInfo:nil];
+        NSWindow *window = NSApp.mainWindow ?: NSApp.windows.firstObject;
+        if (!window) @throw [NSException exceptionWithName:@"CDP" reason:@"No native app window" userInfo:nil];
+        if (!debugPicker) debugPicker = [GeaDebugPicker new];
+        self.pickerHoverNode = nil;
+        [debugPicker startInWindow:window delegate:self];
+        [window makeKeyAndOrderFront:nil];
+        [NSApp activateIgnoringOtherApps:YES];
+        return @{};
+    }
     if ([method isEqual:@"Overlay.enable"] || [method isEqual:@"Overlay.disable"]) {
-        if ([method isEqual:@"Overlay.disable"])
+        if ([method isEqual:@"Overlay.disable"]) {
+            if (debugPicker.delegate == self) [debugPicker stop];
             [debugOverlay removeFromSuperview];
+        }
         return @{};
     }
     if ([method isEqual:@"Overlay.hideHighlight"] || [method isEqual:@"DOM.hideHighlight"]) {
@@ -1074,16 +1317,7 @@ const console = Object.fromEntries(['log','info','warn','error','debug'].map(t=>
         NSNumber *id = p[@"nodeId"] ?: p[@"backendNodeId"];
         if (!id && p[@"objectId"])
             id = [self.objects[p[@"objectId"]][@"__geaNodeId"] toNumber];
-        const auto &n = Tree::instance().node([self slot:id]);
-        NSView *parent = NSApp.mainWindow.contentView ?: NSApp.windows.firstObject.contentView;
-        if (!debugOverlay)
-            debugOverlay = [[GeaDebugOverlay alloc] init];
-        [debugOverlay removeFromSuperview];
-        debugOverlay.frame =
-            NSMakeRect(n.layout.x, parent.bounds.size.height - n.layout.y - n.layout.height,
-                       n.layout.width, n.layout.height);
-        [parent addSubview:debugOverlay positioned:NSWindowAbove relativeTo:nil];
-        [debugOverlay setNeedsDisplay:YES];
+        [self highlight:id];
         return @{};
     }
     if ([method isEqual:@"DOM.getNodeForLocation"]) {
@@ -1117,24 +1351,21 @@ const console = Object.fromEntries(['log','info','warn','error','debug'].map(t=>
     if ([method isEqual:@"CSS.getMatchedStylesForNode"]) {
         int slot = [self slot:p[@"nodeId"]];
         NSMutableArray *matched = [NSMutableArray array];
+        [self refreshRuleSheets];
+        NSMutableSet *seen = [NSMutableSet set];
         for (const auto &rule : debuggerMatchedCssRules(slot)) {
-            if (rule.property.empty())
-                continue;
-            NSDictionary *property = @{
-                @"name" : str(rule.property.c_str()),
-                @"value" : str(rule.value.c_str()),
-                @"text" : [NSString
-                    stringWithFormat:@"%s: %s;", rule.property.c_str(), rule.value.c_str()]
-            };
+            NSString *selector = str(rule.selector.c_str());
+            NSString *sheetId = ruleSheetId(selector, str(rule.media.c_str()), rule.userAgent);
+            if ([seen containsObject:sheetId]) continue;
+            [seen addObject:sheetId];
+            NSDictionary *sheet = self.ruleSheets[sheetId];
             [matched addObject:@{
-                @"matchingSelectors" : @[ @0 ],
-                @"rule" : @{
-                    @"selectorList" : @{
-                        @"text" : str(rule.selector.c_str()),
-                        @"selectors" : @[ @{@"text" : str(rule.selector.c_str())} ]
-                    },
-                    @"origin" : rule.userAgent ? @"user-agent" : @"regular",
-                    @"style" : @{@"cssProperties" : @[ property ], @"shorthandEntries" : @[]}
+                @"matchingSelectors":@[ @0 ],
+                @"rule":@{
+                    @"styleSheetId":sheetId,
+                    @"selectorList":@{@"text":selector, @"selectors":@[ @{@"text":selector} ]},
+                    @"origin":rule.userAgent ? @"user-agent" : @"regular",
+                    @"style":[self cssStyle:sheet[@"text"] sheet:sheetId owner:nil userAgent:rule.userAgent]
                 }
             }];
         }
@@ -1153,43 +1384,53 @@ const console = Object.fromEntries(['log','info','warn','error','debug'].map(t=>
         return @{};
     }
     if ([method isEqual:@"CSS.setStyleTexts"]) {
+        [self refreshRuleSheets];
         NSMutableArray *styles = [NSMutableArray array];
+        NSMutableSet *changed = [NSMutableSet set];
         for (NSDictionary *edit in p[@"edits"]) {
-            NSString *sheet = edit[@"styleSheetId"];
-            if (![sheet hasPrefix:@"inline-"])
-                @throw [NSException exceptionWithName:@"CDP"
-                                               reason:@"Only native inline styles are editable"
-                                             userInfo:nil];
-            NSNumber *id = @([[sheet substringFromIndex:7] intValue]);
-            NSDictionary *old = [self inlineStyle:id];
-            NSDictionary *range = edit[@"range"];
+            NSString *sheetId = edit[@"styleSheetId"];
+            NSDictionary *sheet = self.ruleSheets[sheetId];
+            const BOOL inlineStyle = [sheetId hasPrefix:@"inline-"];
+            if (!sheet && !inlineStyle)
+                @throw [NSException exceptionWithName:@"CDP" reason:@"Unknown native stylesheet" userInfo:nil];
+            if ([sheet[@"userAgent"] boolValue])
+                @throw [NSException exceptionWithName:@"CDP" reason:@"User agent stylesheet is read-only" userInfo:nil];
+            NSNumber *id = inlineStyle ? @([[sheetId substringFromIndex:7] intValue]) : nil;
+            NSDictionary *old = inlineStyle ? [self inlineStyle:id] : [self cssStyle:sheet[@"text"] sheet:sheetId owner:nil userAgent:NO];
             NSString *text = old[@"cssText"];
-            if ([range[@"startLine"] intValue] || [range[@"endLine"] intValue])
-                @throw [NSException exceptionWithName:@"CDP"
-                                               reason:@"Inline styles use a single line"
-                                             userInfo:nil];
-            NSInteger start = [range[@"startColumn"] integerValue],
-                      end = [range[@"endColumn"] integerValue];
-            if (start < 0 || end < start || end > (NSInteger)text.length)
-                @throw [NSException exceptionWithName:@"CDP"
-                                               reason:@"Invalid style range"
-                                             userInfo:nil];
-            [self setStyleText:[text stringByReplacingCharactersInRange:NSMakeRange(start,
-                                                                                    end - start)
-                                                             withString:edit[@"text"]]
-                          node:id];
-            [styles addObject:[self inlineStyle:id]];
+            NSString *next = [self cssCall:@"replaceCssRange" arguments:@[ text, edit[@"range"], edit[@"text"] ]];
+            if (inlineStyle) {
+                [self setStyleText:next node:id];
+                [styles addObject:[self inlineStyle:id]];
+            } else {
+                NSArray *operations = [self cssCall:@"cssMutations" arguments:@[ text, sheet[@"values"], next ]];
+                for (NSDictionary *operation in operations) {
+                    NSString *key = operation[@"key"], *value = operation[@"value"];
+                    if (!debuggerSetCssRule([sheet[@"selector"] UTF8String], [sheet[@"media"] UTF8String], key.UTF8String, value.UTF8String))
+                        @throw [NSException exceptionWithName:@"CDP" reason:@"Native CSS rule no longer exists" userInfo:nil];
+                }
+                // Capture the resulting projection before reconciling the authored text.
+                debugRuleStyles[sheetId] = @{@"text":next, @"projection":@{}, @"editing":@YES};
+                [self refreshRuleSheets];
+                debugRuleStyles[sheetId] = @{@"text":next, @"projection":self.ruleSheets[sheetId][@"values"]};
+                [styles addObject:[self cssStyle:next sheet:sheetId owner:nil userAgent:NO]];
+            }
+            [changed addObject:sheetId];
         }
-        return @{@"styles" : styles};
+        // Let Chrome commit its edited ranges before reloading the sidebar.
+        if (changed.count) dispatch_async(dispatch_get_main_queue(), ^{
+            for (NSString *sheetId in changed) [self emit:@"CSS.styleSheetChanged" params:@{@"styleSheetId":sheetId}];
+        });
+        return @{@"styles":styles};
     }
     if ([method isEqual:@"CSS.getStyleSheetText"]) {
-        NSString *sheet = p[@"styleSheetId"];
-        if (![sheet hasPrefix:@"inline-"])
-            @throw [NSException exceptionWithName:@"CDP"
-                                           reason:@"Unknown style sheet"
-                                         userInfo:nil];
-        return
-            @{@"text" : [self inlineStyle:@([[sheet substringFromIndex:7] intValue])][@"cssText"]};
+        NSString *sheetId = p[@"styleSheetId"];
+        [self refreshRuleSheets];
+        NSDictionary *sheet = self.ruleSheets[sheetId];
+        if (sheet) return @{@"text":[self cssStyle:sheet[@"text"] sheet:sheetId owner:nil userAgent:[sheet[@"userAgent"] boolValue]][@"cssText"]};
+        if ([sheetId hasPrefix:@"inline-"])
+            return @{@"text":[self inlineStyle:@([[sheetId substringFromIndex:7] intValue])][@"cssText"]};
+        @throw [NSException exceptionWithName:@"CDP" reason:@"Unknown native stylesheet" userInfo:nil];
     }
     if ([method isEqual:@"CSS.getMediaQueries"])
         return @{@"medias" : @[]};
@@ -1285,14 +1526,16 @@ const console = Object.fromEntries(['log','info','warn','error','debug'].map(t=>
     if ([method isEqual:@"Runtime.globalLexicalScopeNames"])
         return @{
             @"names" :
-                @[ @"document", @"window", @"$", @"$$", @"$0", @"getComputedStyle", @"console" ]
+                @[ @"document", @"window", @"$", @"$$", @"$0", @"getComputedStyle", @"getEventListeners", @"inspect",
+                   @"console" ]
         };
     if ([method isEqual:@"Page.getFrameTree"])
         return @{@"frameTree" : @{@"frame" : frameInfo()}};
     if ([method isEqual:@"Page.getResourceTree"])
         return @{@"frameTree" : @{@"frame" : frameInfo(), @"resources" : @[]}};
     if ([method isEqual:@"Page.getLayoutMetrics"]) {
-        NSSize s = NSApp.mainWindow.contentView.bounds.size;
+        NSView *view = NSApp.mainWindow.contentView ?: NSApp.windows.firstObject.contentView;
+        NSSize s = view.bounds.size;
         NSDictionary *v = @{
             @"pageX" : @0,
             @"pageY" : @0,
@@ -1470,7 +1713,7 @@ void gea_macos_debugger_start() {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(atoi(getenv("GEA_DEBUGGER_NATIVE_PORT")));
-    if (fd < 0 || bind(fd, (sockaddr *)&addr, sizeof(addr)) || listen(fd, 4)) {
+    if (fd < 0 || bind(fd, (sockaddr *)&addr, sizeof(addr)) || listen(fd, 8)) {
         perror("Gea native debugger listen");
         if (fd >= 0)
             close(fd);
@@ -1480,6 +1723,7 @@ void gea_macos_debugger_start() {
     socklen_t length = sizeof(addr);
     getsockname(fd, (sockaddr *)&addr, &length);
     debugStyles = [NSMutableDictionary dictionary];
+    debugRuleStyles = [NSMutableDictionary dictionary];
     NSMutableArray<GeaDebugSession *> *sessions = [NSMutableArray array];
     NSTimer *timer = [NSTimer
         timerWithTimeInterval:0.05
@@ -1487,7 +1731,7 @@ void gea_macos_debugger_start() {
                         block:^(NSTimer *) {
                           int peer;
                           while ((peer = accept(fd, nullptr, nullptr)) >= 0) {
-                              if (sessions.count >= 4) {
+                              if (sessions.count >= 6) {
                                   close(peer);
                                   continue;
                               }
@@ -1500,8 +1744,13 @@ void gea_macos_debugger_start() {
                           }
                           for (GeaDebugSession *session in [sessions copy]) {
                               [session poll];
-                              if (session.fd < 0)
+                              if (session.fd < 0) {
+                                  if (debugPicker.delegate == session) {
+                                      [debugPicker stop];
+                                      [debugOverlay removeFromSuperview];
+                                  }
                                   [sessions removeObject:session];
+                              }
                           }
                         }];
     [NSRunLoop.mainRunLoop addTimer:timer forMode:NSRunLoopCommonModes];

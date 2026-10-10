@@ -8,8 +8,22 @@ import { WebSocketServer } from 'ws'
 import { chromeExecutable, portNumber } from './launch.mjs'
 import { connectCDP } from './cdp.mjs'
 import { acceptsOrigin } from './transport.mjs'
-import { createNativeDebugger } from './gdb.mjs'
+import { createNativeDebugger, ElfLines, StaticSources, selectNativeDebugBuild } from './gdb.mjs'
 import { previewFonts } from './preview-fonts.mjs'
+import { compatResult } from './compat.mjs'
+import {
+  Changes,
+  RECORDED_METHODS,
+  loadOverridesFile,
+  saveOverridesFile,
+  serveChanges,
+} from './changes.mjs'
+import { bundledFrontend, frontendManifest, serveFrontend } from './frontend.mjs'
+import { outerHTML } from './html.mjs'
+import {
+  cssStyle as authoredCssStyle, cssValues, serializeCss, reconcileCss,
+  replaceCssRange, setCssProperty, cssMutations, cssRange,
+} from './css.mjs'
 
 // One queue owns USB. Polling and every inspector share it, so replies cannot
 // cross request boundaries. The device never evaluates JavaScript.
@@ -99,6 +113,15 @@ export class DeviceTransport {
             debugFps: Number(meta.fps || 0),
             elf: meta.elf,
             nativeHighlight: meta.overlay === '1',
+            nativePicker: meta.picker === '1',
+            nativeListeners: meta.listeners === '1',
+            inspect: {
+              token: Number(meta.inspectToken || 0),
+              active: meta.inspectActive === '1',
+              hover: Number(meta.inspectHover || 0),
+              node: Number(meta.inspectNode || 0),
+              revision: Number(meta.inspectRevision || 0),
+            },
           }
           if (nodes.size !== payload.length || !nodes.has(snapshot.root))
             throw new Error('Snapshot has duplicate identities or no mounted root')
@@ -136,6 +159,41 @@ export class DeviceTransport {
   mutate(request) {
     return this.enqueue(() => this.writeMutation(request))
   }
+  // JSX listeners of the given element identities, with the firmware call
+  // sites that registered them. Lists are chunked to fit the command line.
+  listeners(ids) {
+    return this.enqueue(async () => {
+      const records = []
+      for (let start = 0; start < ids.length; ) {
+        const chunk = []
+        while (start < ids.length && chunk.length < 64 && (chunk.join(',') + ',' + ids[start]).length < 400)
+          chunk.push(ids[start++])
+        const sequence = this.nextSequence++
+        const { lines, end } = await this.serial.collect(
+          `GEADEV DEBUG LISTENERS ${sequence} ${chunk.join(',')}`,
+          {
+            begin: (frame) => frame === `GEADEV:DEBUG LISTENERS BEGIN sequence=${sequence}`,
+            data: '\0',
+            end: 'GEADEV:DEBUG LISTENERS END',
+            timeoutMs: 8000,
+          },
+        )
+        const meta = Object.fromEntries(
+          end
+            .split(' ')
+            .slice(3)
+            .map((pair) => pair.split('=')),
+        )
+        const payload = lines.filter((line) => line.startsWith('GEADEV:DEBUG LISTENER '))
+        if (Number(meta.sequence) !== sequence || Number(meta.count) !== payload.length)
+          throw new Error('Listener reply integrity check failed')
+        if (this.boot !== null && meta.boot !== this.boot)
+          throw new Error('Device rebooted; reconnect to invalidate old node references')
+        for (const line of payload) records.push(JSON.parse(line.slice(22)))
+      }
+      return records
+    })
+  }
   async writeMutation(request) {
     if (this.debuggerState?.paused)
       throw new Error('Resume the native app before changing its tree or styles')
@@ -146,8 +204,64 @@ export class DeviceTransport {
       const result = await this.serial.command(`GEADEV DEBUG ${encoded}`, ['GEADEV:DEBUG OK'], 8000)
       return Number(/id=(\d+)/.exec(result)?.[1] || 0)
     } finally {
-      if (request.op !== 'highlight') this.cached = null
+      if (request.op !== 'highlight' && !(request.op === 'inspect' && request.mode === 'keepAlive'))
+        this.cached = null
     }
+  }
+  async setInspectMode(mode, owner) {
+    if (mode === 'none') return this.cancelInspect(owner)
+    if (!['searchForNode', 'searchForUAShadowDOM'].includes(mode))
+      throw new Error(`Unsupported inspect mode: ${mode}`)
+    if (!(await this.snapshot()).nativePicker)
+      throw new Error('Element picking needs a fresh debug firmware build; run without --attach')
+    if (this.debuggerState?.paused) throw new Error('Resume the native app before picking an element')
+    const previous = this.inspection
+    let token
+    do { token = randomInt(1, 0x7fffffff) }
+    while (token === previous?.token || token === this.lastGood?.inspect?.token)
+    const inspection = { token, owner, hover: 0 }
+    this.inspection = inspection
+    if (previous && previous.owner !== owner)
+      previous.owner.emit('Overlay.inspectModeCanceled', {})
+    try {
+      await this.mutate({ op: 'inspect', token: inspection.token, mode })
+    } catch (error) {
+      if (this.inspection === inspection) this.inspection = null
+      throw error
+    }
+  }
+  async cancelInspect(owner) {
+    const inspection = this.inspection
+    if (!inspection || (owner && inspection.owner !== owner)) return
+    this.inspection = null
+    // A halted native app cannot answer USB. Its lease restores input on resume.
+    if (!this.debuggerState?.paused)
+      await this.mutate({ op: 'inspect', token: inspection.token, mode: 'none' })
+  }
+  keepInspectAlive() {
+    if (!this.inspection || this.debuggerState?.paused || this.inspectRenewal) return
+    const { token } = this.inspection
+    const pending = this.mutate({ op: 'inspect', token, mode: 'keepAlive' })
+    this.inspectRenewal = pending
+    pending.finally(() => {
+      if (this.inspectRenewal === pending) this.inspectRenewal = null
+    }).catch(() => {})
+    return pending
+  }
+  async inspectPoint({ token, mode, x, y }) {
+    const inspection = this.inspection
+    if (!inspection || token !== inspection.token) throw new Error('Element picker is no longer active')
+    if (!['hover', 'select', 'leave'].includes(mode) ||
+        (mode !== 'leave' && (!Number.isSafeInteger(x) || !Number.isSafeInteger(y) ||
+         x < 0 || y < 0 || x >= this.lastGood.width || y >= this.lastGood.height)))
+      throw new Error('Invalid picker coordinates or mode')
+    // One preview request at a time; coalescing in the client keeps USB bounded.
+    if (this.inspectPointPending) throw new Error('Picker request already in progress')
+    this.inspectPointPending = true
+    try {
+      await this.mutate({ op: 'inspectPoint', token, mode, ...(mode === 'leave' ? {} : { x, y }) })
+      if (!inspection.owner.closed) await inspection.owner.refresh(true)
+    } finally { this.inspectPointPending = false }
   }
   setHighlight(id, color = { r: 0, g: 200, b: 255 }, owner = null) {
     this.highlight = id
@@ -161,10 +275,10 @@ export class DeviceTransport {
     return this.setHighlight(0)
   }
   flushHighlight() {
-    if (!this.lastGood?.nativeHighlight || this.debuggerState?.paused) return Promise.resolve()
+    if (!this.lastGood?.nativeHighlight || this.debuggerState?.paused || this.inspection) return Promise.resolve()
     if (!this.highlightWrite) {
       const pending = this.enqueue(async () => {
-        while (this.highlightWritten !== this.highlightRevision && !this.debuggerState?.paused) {
+        while (this.highlightWritten !== this.highlightRevision && !this.debuggerState?.paused && !this.inspection) {
           const revision = this.highlightRevision
           const color = this.highlightColor || { r: 0, g: 200, b: 255 }
           await this.writeMutation({
@@ -188,38 +302,10 @@ export class DeviceTransport {
   }
 }
 
-function cssStyle(id, declarations, styleSheetId = `inline-${id}`) {
-  let offset = 0
-  const cssProperties = Object.entries(declarations).map(([name, value]) => {
-    const text = `${name}: ${value};`
-    const startColumn = offset
-    offset += text.length + 1
-    return {
-      name,
-      value,
-      text,
-      implicit: false,
-      disabled: false,
-      parsedOk: true,
-      range: { startLine: 0, startColumn, endLine: 0, endColumn: offset - 1 },
-    }
-  })
-  return {
-    styleSheetId,
-    cssProperties,
-    shorthandEntries: [],
-    cssText: cssProperties.map((p) => p.text).join(' '),
-    range: { startLine: 0, startColumn: 0, endLine: 0, endColumn: Math.max(0, offset - 1) },
-  }
+function cssStyle(id, text, styleSheetId = `inline-${id}`) {
+  return authoredCssStyle(text, styleSheetId)
 }
-function declarations(text) {
-  const out = {}
-  for (const part of text.split(';')) {
-    const colon = part.indexOf(':')
-    if (colon > 0) out[part.slice(0, colon).trim()] = part.slice(colon + 1).trim()
-  }
-  return out
-}
+const styleDocuments = new WeakMap()
 
 function ruleSheets(nodes) {
   const sheets = new Map()
@@ -242,7 +328,8 @@ function ruleSheets(nodes) {
     }
   return sheets
 }
-function sheetHeader(id, length = 0, ownerNode) {
+function sheetHeader(id, text = '', ownerNode) {
+  const { endLine, endColumn } = cssRange(text)
   return {
     styleSheetId: id,
     frameId: 'gea',
@@ -254,9 +341,9 @@ function sheetHeader(id, length = 0, ownerNode) {
     isMutable: true,
     startLine: 0,
     startColumn: 0,
-    length,
-    endLine: 0,
-    endColumn: length,
+    length: text.length,
+    endLine,
+    endColumn,
     ...(ownerNode ? { ownerNode } : {}),
   }
 }
@@ -264,6 +351,8 @@ function sheetHeader(id, length = 0, ownerNode) {
 export class DeviceSession {
   constructor(transport, emit = () => {}) {
     this.transport = transport
+    if (!styleDocuments.has(transport)) styleDocuments.set(transport, { inline: new Map(), rules: new Map() })
+    this.styleDocuments = styleDocuments.get(transport)
     this.emit = emit
     this.nodes = new Map()
     this.publishedChildren = new Set()
@@ -394,10 +483,11 @@ export class DeviceSession {
         {
           setProperty(key, value) {
             read(id)
-            session.queue({ op: 'style', id, key, value: String(value) })
-            const styles = session.styles.get(id) || {}
-            styles[key] = String(value)
-            session.styles.set(id, styles)
+            const document = session.styleDocuments.inline.get(id) || reconcileCss(null, {})
+            const text = setCssProperty(document.text, key, String(value))
+            session.queue({ op: 'styleText', id, value: text, previous: document.text })
+            session.styleDocuments.inline.set(id, { ...document, text, editing: true })
+            session.styles.set(id, cssValues(text))
           },
           removeProperty(key) {
             this.setProperty(key, '')
@@ -409,19 +499,18 @@ export class DeviceSession {
         },
         {
           get(target, key) {
-            if (key === 'cssText') return cssStyle(id, session.styles.get(id) || {}).cssText
+            if (key === 'cssText') return session.styleText(id)
             return key in target
               ? target[key]
               : target.getPropertyValue(String(key).replace(/[A-Z]/g, (c) => '-' + c.toLowerCase()))
           },
           set(target, key, value) {
             if (key === 'cssText') {
-              const next = declarations(String(value))
-              for (const name of new Set([
-                ...Object.keys(session.styles.get(id) || {}),
-                ...Object.keys(next),
-              ]))
-                target.setProperty(name, next[name] || '')
+              read(id)
+              const document = session.styleDocuments.inline.get(id) || reconcileCss(null, {})
+              session.queue({ op: 'styleText', id, value: String(value), previous: document.text })
+              session.styleDocuments.inline.set(id, { ...document, text: String(value), editing: true })
+              session.styles.set(id, cssValues(String(value)))
               return true
             }
             target.setProperty(
@@ -500,6 +589,10 @@ export class DeviceSession {
         $: document.querySelector,
         $$: document.querySelectorAll,
         getComputedStyle,
+        // Reveals the node in Elements, as in Chrome.
+        inspect: (node) => {
+          this.emit('Runtime.inspectRequested', { object: this.remote(node), hints: {}, executionContextId: 1 })
+        },
         console: Object.fromEntries(
           ['log', 'warn', 'error', 'info', 'debug'].map((type) => [
             type,
@@ -545,25 +638,34 @@ export class DeviceSession {
   async refresh(notify = false) {
     const snapshot = structuredClone(await this.transport.snapshot())
     for (const node of snapshot.nodes.values()) {
-      const text = cssStyle(node.id, node.inline || {}).cssText
+      const document = reconcileCss(this.styleDocuments.inline.get(node.id), node.inline || {})
+      this.styleDocuments.inline.set(node.id, document)
+      const text = document.text
       if (text) node.attributes.style = text
       else delete node.attributes.style
     }
     const old = this.authoritative || this.nodes
     this.nodes = snapshot.nodes
     this.authoritative = structuredClone(snapshot.nodes)
-    this.styles = new Map([...this.nodes].map(([id, n]) => [id, n.inline || {}]))
+    for (const id of this.styleDocuments.inline.keys())
+      if (!this.nodes.has(id)) this.styleDocuments.inline.delete(id)
+    this.styles = new Map([...this.nodes].map(([id]) => [id, cssValues(this.styleText(id))]))
     this.root = snapshot.root
     this.width = snapshot.width
     this.height = snapshot.height
     this.debugFps = snapshot.debugFps || 0
     this.ruleSheets = ruleSheets(this.nodes)
+    for (const [id, sheet] of this.ruleSheets) {
+      const document = reconcileCss(this.styleDocuments.rules.get(id), sheet.values)
+      this.styleDocuments.rules.set(id, document)
+      sheet.text = document.text
+    }
     if (notify && this.cssEnabled) {
       const before = ruleSheets(old)
       for (const [id, sheet] of this.ruleSheets) {
         if (!before.has(id))
           this.emit('CSS.styleSheetAdded', {
-            header: sheetHeader(id, cssStyle(0, sheet.values, id).cssText.length),
+            header: sheetHeader(id, sheet.text),
           })
         else if (JSON.stringify(before.get(id).values) !== JSON.stringify(sheet.values))
           this.emit('CSS.styleSheetChanged', { styleSheetId: id })
@@ -622,12 +724,45 @@ export class DeviceSession {
         if (changed.length) this.emit('DOM.inlineStyleInvalidated', { nodeIds: changed })
       }
     }
+    this.updateInspection(snapshot.inspect)
+  }
+  updateInspection(status) {
+    const inspection = this.transport.inspection
+    if (!inspection || inspection.owner !== this || this.closed || !status ||
+        status.token !== inspection.token) return
+    if (status.hover && status.hover !== inspection.hover && this.nodes.has(status.hover)) {
+      this.publishPath(status.hover)
+      this.emit('Overlay.nodeHighlightRequested', { nodeId: status.hover })
+    }
+    inspection.hover = status.hover
+    if (status.active) return
+    this.transport.inspection = null
+    if (status.node && this.nodes.has(status.node)) {
+      this.selected = status.node
+      this.publishPath(status.node)
+      this.transport.highlight = status.node
+      this.transport.highlightOwner = this
+      this.emit('Overlay.inspectNodeRequested', { backendNodeId: status.node })
+    } else this.emit('Overlay.inspectModeCanceled', {})
   }
   async flush() {
     const pending = this.pending.splice(0)
+    const styles = new Set(pending.filter(op => op.op === 'styleText').map(op => op.id))
+    this.consoleEditing = true
     try {
-      for (const operation of pending) await this.transport.mutate(operation)
+      for (const operation of pending) {
+        if (operation.op === 'styleText')
+          await this.applyStyleText(operation.id, operation.value, null, operation.previous)
+        else await this.transport.mutate(operation)
+      }
     } finally {
+      this.consoleEditing = false
+      for (const id of styles) {
+        const document = this.styleDocuments.inline.get(id)
+        if (document) this.styleDocuments.inline.set(id, {
+          text: document.text, projection: document.projection,
+        })
+      }
       await this.refresh(true)
     }
   }
@@ -648,13 +783,84 @@ export class DeviceSession {
       type,
       objectId,
       ...(value?.__geaNodeId
-        ? { subtype: 'node', className: 'NativeElement', description: value.tagName.toLowerCase() }
+        ? { subtype: 'node', className: 'NativeElement', description: this.describe(value.__geaNodeId) }
         : Array.isArray(value)
           ? { subtype: 'array', className: 'Array', description: `Array(${value.length})` }
           : {
               className: type === 'function' ? 'Function' : 'Object',
               description: type === 'function' ? String(value) : 'Object',
             }),
+    }
+  }
+  // Chrome-style node label: tag#id.class
+  describe(id) {
+    const node = this.nodes.get(id & ~1)
+    if (!node) return 'node'
+    const classes = String(node.attributes?.class || '')
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((name) => '.' + name)
+      .join('')
+    return node.tag + (node.attributes?.id ? '#' + node.attributes.id : '') + classes
+  }
+  // DOMDebugger.getEventListeners: JSX handlers on a node and, with depth,
+  // its descendants. Handler values are metadata, not invocable callbacks.
+  async eventListeners(p) {
+    const value = this.object(p.objectId)
+    if (!value?.__geaNodeId) throw new Error('Object is not a native node')
+    const depth = p.depth ?? 1
+    if (!Number.isInteger(depth) || depth < -1) throw new Error('Invalid event listener depth')
+    await this.refresh()
+    if (!this.transport.lastGood?.nativeListeners)
+      throw new Error('This debug firmware cannot report event listeners; rebuild without --attach')
+    const ids = []
+    const pending = [[value.__geaNodeId & ~1, depth]]
+    while (pending.length && ids.length < 512) {
+      const [id, remaining] = pending.pop()
+      const node = this.nodes.get(id)
+      if (!node) continue
+      ids.push(id)
+      if (remaining === -1 || remaining > 1)
+        for (const child of node.children.toReversed())
+          pending.push([child, remaining === -1 ? -1 : remaining - 1])
+    }
+    const records = await this.transport.listeners(ids)
+    const locations = this.transport.elfLines
+      ? await this.transport.elfLines.locations(records.flatMap((record) => record.sites))
+      : {}
+    const group = p.objectGroup || 'event-listeners'
+    return {
+      listeners: records.map((record) => {
+        const tag = this.nodes.get(record.id)?.tag || 'div'
+        const resolved = record.sites.map((site) => locations[site]).filter(Boolean)
+        // Registration passes through runtime helpers; prefer the first
+        // caller in the app's own mapped source.
+        const found = resolved.find((location) => location.scriptId === 'native-app')
+        const unmapped = resolved.find((location) => location.functionName)?.functionName
+        const objectId = 'gea-listener-' + this.nextObject++
+        this.objects.set(objectId, {
+          value: Object.freeze({ type: record.type, node: tag, callers: record.sites.map((site) => '0x' + site.toString(16)).join(' ← ') }),
+          group,
+        })
+        const handler = {
+          type: 'function',
+          className: 'GeaListener',
+          description: `${record.type} listener on <${tag}>${!found && unmapped ? ' · ' + unmapped : ''}`,
+          objectId,
+        }
+        return {
+          type: record.type,
+          useCapture: false,
+          passive: false,
+          once: false,
+          scriptId: found?.scriptId || '',
+          lineNumber: found?.lineNumber || 0,
+          columnNumber: found?.columnNumber || 0,
+          handler,
+          originalHandler: handler,
+          backendNodeId: record.id,
+        }
+      }),
     }
   }
   object(id) {
@@ -726,10 +932,43 @@ export class DeviceSession {
       for (const child of node.children)
         this.publishChildren(child.nodeId, depth < 0 ? -1 : depth - 1)
   }
+  publishPath(id) {
+    const path = [], seen = new Set()
+    for (let node = id; this.nodes.has(node) && !seen.has(node); node = this.nodes.get(node).parent) {
+      seen.add(node)
+      path.push(node)
+    }
+    this.publishChildren(1, 1)
+    this.publishChildren(2, 1)
+    for (const node of path.reverse()) this.publishChildren(node, 1)
+  }
+  styleText(id) {
+    return this.styleDocuments.inline.get(id)?.text || ''
+  }
+  async applyStyleText(id, text, sheet = null, previous = null) {
+    const documents = sheet ? this.styleDocuments.rules : this.styleDocuments.inline
+    const key = sheet ? sheet.id : id
+    const document = documents.get(key) || reconcileCss(null, {})
+    documents.set(key, { ...document, editing: true })
+    try {
+      const current = await this.transport.snapshot()
+      const before = sheet ? ruleSheets(current.nodes).get(key)?.values || {}
+        : current.nodes.get(id)?.inline || {}
+      for (const operation of cssMutations(previous ?? document.text, before, text))
+        await this.transport.mutate(sheet
+          ? { op: 'rule', selector: sheet.selector, media: sheet.media, ...operation }
+          : { op: 'style', id, ...operation })
+      const snapshot = await this.transport.snapshot({ fresh: true })
+      const projection = sheet ? ruleSheets(snapshot.nodes).get(key)?.values || {}
+        : snapshot.nodes.get(id)?.inline || {}
+      documents.set(key, { text, projection, ...(this.consoleEditing ? { editing: true } : {}) })
+    } catch (error) {
+      documents.set(key, { text: document.text, projection: document.projection })
+      throw error
+    }
+  }
   async setInlineAttribute(id, text) {
-    const next = declarations(text)
-    for (const name of new Set([...Object.keys(this.styles.get(id) || {}), ...Object.keys(next)]))
-      await this.transport.mutate({ op: 'style', id, key: name, value: next[name] || '' })
+    await this.applyStyleText(id, text)
   }
   async highlightNode(nodeId, config) {
     if (this.closed) throw new Error('Inspector session closed')
@@ -796,13 +1035,13 @@ export class DeviceSession {
         this.emit('CSS.styleSheetAdded', {
           header: sheetHeader(
             `inline-${id}`,
-            cssStyle(id, this.styles.get(id) || {}).cssText.length,
+            this.styleText(id),
             id,
           ),
         })
       for (const [id, sheet] of this.ruleSheets)
         this.emit('CSS.styleSheetAdded', {
-          header: sheetHeader(id, cssStyle(0, sheet.values, id).cssText.length),
+          header: sheetHeader(id, sheet.text),
         })
       return {}
     }
@@ -840,6 +1079,10 @@ export class DeviceSession {
       await this.highlightNode(p.nodeId)
       return {}
     }
+    if (method === 'Overlay.setInspectMode') {
+      await this.transport.setInspectMode(p.mode, this)
+      return {}
+    }
     if (method === 'Overlay.highlightNode' || method === 'DOM.highlightNode') {
       await this.highlightNode(
         p.nodeId || p.backendNodeId || (p.objectId ? this.object(p.objectId).__geaNodeId : 0),
@@ -852,6 +1095,7 @@ export class DeviceSession {
       method === 'DOM.hideHighlight' ||
       method === 'Overlay.disable'
     ) {
+      if (method === 'Overlay.disable') await this.transport.cancelInspect?.(this)
       if (this.transport.clearHighlight) await this.transport.clearHighlight(this)
       else this.transport.highlight = 0
       return {}
@@ -860,7 +1104,11 @@ export class DeviceSession {
       return { object: this.remote(this.wrap(p.nodeId || p.backendNodeId), p.objectGroup) }
     if (method === 'DOM.requestNode') return { nodeId: this.object(p.objectId).__geaNodeId }
     if (method === 'DOM.pushNodesByBackendIdsToFrontend')
-      return { nodeIds: p.backendNodeIds.map((id) => (this.nodes.has(id) ? id : 0)) }
+      return { nodeIds: p.backendNodeIds.map((id) => {
+        if (!this.nodes.has(id)) return 0
+        this.publishPath(id)
+        return id
+      }) }
     if (method === 'DOM.getBoxModel' || method === 'DOM.getContentQuads') {
       const n = this.nodes.get(p.nodeId || p.backendNodeId || this.object(p.objectId).__geaNodeId)
       if (!n) throw new Error('Stale node')
@@ -927,13 +1175,13 @@ export class DeviceSession {
     }
     if (method === 'CSS.getInlineStylesForNode')
       return {
-        inlineStyle: cssStyle(p.nodeId, this.styles.get(p.nodeId) || {}),
+        inlineStyle: cssStyle(p.nodeId, this.styleText(p.nodeId)),
         attributesStyle: { cssProperties: [], shorthandEntries: [] },
       }
     if (method === 'CSS.getMatchedStylesForNode') {
       const matched = ruleSheets(new Map([[p.nodeId, this.nodes.get(p.nodeId) || {}]]))
       return {
-        inlineStyle: cssStyle(p.nodeId, this.styles.get(p.nodeId) || {}),
+        inlineStyle: cssStyle(p.nodeId, this.styleText(p.nodeId)),
         attributesStyle: { cssProperties: [], shorthandEntries: [] },
         matchedCSSRules: [...matched].map(([id, sheet]) => ({
           matchingSelectors: [0],
@@ -941,7 +1189,7 @@ export class DeviceSession {
             styleSheetId: id,
             origin: sheet.userAgent ? 'user-agent' : 'regular',
             selectorList: { text: sheet.selector, selectors: [{ text: sheet.selector }] },
-            style: cssStyle(0, sheet.values, id),
+            style: cssStyle(0, this.styleDocuments.rules.get(id)?.text || serializeCss(sheet.values), id),
           },
         })),
         inherited: [],
@@ -951,14 +1199,9 @@ export class DeviceSession {
     }
     if (method === 'CSS.getStyleSheetText') {
       const sheet = this.ruleSheets.get(p.styleSheetId)
-      return {
-        text: sheet
-          ? cssStyle(0, sheet.values, p.styleSheetId).cssText
-          : cssStyle(
-              Number(p.styleSheetId.slice(7)),
-              this.styles.get(Number(p.styleSheetId.slice(7))) || {},
-            ).cssText,
-      }
+      if (!sheet && !p.styleSheetId?.startsWith('inline-')) throw new Error('Unknown native stylesheet')
+      return { text: sheet ? this.styleDocuments.rules.get(sheet.id).text
+        : this.styleText(Number(p.styleSheetId.slice(7))) }
     }
     if (method === 'CSS.setStyleTexts') {
       const edited = []
@@ -969,53 +1212,18 @@ export class DeviceSession {
         if (sheet?.userAgent) throw new Error('User agent stylesheet is read-only')
         const id = sheet ? 0 : Number(edit.styleSheetId.slice(7))
         if (!sheet && !this.nodes.has(id)) throw new Error('Stale native node')
-        const current = sheet ? sheet.values : this.styles.get(id) || {}
-        const old = cssStyle(id, current, edit.styleSheetId).cssText
-        const range = edit.range
-        if (
-          range.startLine !== 0 ||
-          range.endLine !== 0 ||
-          range.startColumn < 0 ||
-          range.endColumn < range.startColumn ||
-          range.endColumn > old.length
-        )
-          throw new Error('Invalid or outdated style range; refresh the style and retry')
-        const next = declarations(
-          old.slice(0, range.startColumn) + edit.text + old.slice(range.endColumn),
-        )
-        for (const key of new Set([...Object.keys(current), ...Object.keys(next)]))
-          if ((current[key] || '') !== (next[key] || ''))
-            await this.transport.mutate(
-              sheet
-                ? {
-                    op: 'rule',
-                    selector: sheet.selector,
-                    media: sheet.media,
-                    key,
-                    value: next[key] || '',
-                  }
-                : { op: 'style', id, key, value: next[key] || '' },
-            )
-        edited.push({ id, styleSheetId: edit.styleSheetId, sheet })
+        const current = sheet ? this.styleDocuments.rules.get(sheet.id).text : this.styleText(id)
+        const next = replaceCssRange(current, edit.range, edit.text)
+        await this.applyStyleText(id, next, sheet)
         await this.refresh(false)
+        edited.push(cssStyle(id, next, edit.styleSheetId))
       }
-      // Publish after the response so Chrome commits the edited property/ranges
-      // before its Styles sidebar reloads the changed authored rule.
-      const changedSheets = [...new Set(edited.filter((e) => e.sheet).map((e) => e.styleSheetId))]
-      if (changedSheets.length)
-        setTimeout(() => {
-          for (const styleSheetId of changedSheets)
-            this.emit('CSS.styleSheetChanged', { styleSheetId })
-        }, 0)
-      return {
-        styles: edited.map(({ id, styleSheetId, sheet }) =>
-          cssStyle(
-            id,
-            sheet ? this.ruleSheets.get(styleSheetId)?.values || {} : this.styles.get(id) || {},
-            styleSheetId,
-          ),
-        ),
-      }
+      // Chrome commits the returned ranges before it reloads the sidebar.
+      setTimeout(() => {
+        for (const style of edited)
+          this.emit('CSS.styleSheetChanged', { styleSheetId: style.styleSheetId })
+      }, 0)
+      return { styles: edited }
     }
     if (method === 'Runtime.evaluate' || method === 'Runtime.callFunctionOn') {
       await this.refresh()
@@ -1090,6 +1298,7 @@ export class DeviceSession {
       this.objects.delete(p.objectId)
       return {}
     }
+    if (method === 'DOMDebugger.getEventListeners') return this.eventListeners(p)
     if (method === 'Runtime.releaseObjectGroup') {
       for (const [id, object] of this.objects)
         if (object.group === p.objectGroup) this.objects.delete(id)
@@ -1166,7 +1375,6 @@ export class DeviceSession {
         'Overlay.setShowViewportSizeOnResize',
         'Overlay.setShowGridOverlays',
         'Overlay.setShowFlexOverlays',
-        'Overlay.setInspectMode',
         'Emulation.setEmulatedMedia',
       ].includes(method)
     )
@@ -1183,9 +1391,12 @@ export async function createDeviceRelay({
   pollMs = 750,
   debugFps = 0,
   nativeDebug,
+  listenerSources,
   appRoot,
+  frontend: manifest,
 }) {
   debugPort = portNumber(debugPort, '--debug-port')
+  if (manifest === undefined) manifest = await frontendManifest().catch(() => null)
   const transport = new DeviceTransport(serial)
   if (screenshot)
     transport.screenshot = () => {
@@ -1230,10 +1441,41 @@ export async function createDeviceRelay({
       throw error
     }
   }
+  // Listener source links read the firmware's ELF without touching JTAG.
+  // Without --debug-sources, a read-only Sources view supplies the script.
+  const sources = nativeDebug || listenerSources
+  if (sources?.builds?.length && transport.cached?.nativeListeners) {
+    try {
+      const build = selectNativeDebugBuild(sources.builds, transport.cached.elf)
+      const info = JSON.parse(readFileSync(build.metadata, 'utf8'))
+      transport.elfLines = new ElfLines(sources.gdbExecutable, build.elf, info, { env: sources.env })
+      transport.debuggerState ||= new StaticSources(info)
+    } catch {}
+  }
   await transport.clearHighlight()
   const endpoint = `ws://127.0.0.1:${debugPort}/devtools/page/gea`
-  // inspector.html replaces protocol hover with a local screencast painter.
-  const frontend = `devtools://devtools/bundled/devtools_app.html?ws=127.0.0.1:${debugPort}/devtools/page/gea`
+  // The bundled frontend adds Gea Changes and zoom. Chrome's own frontend
+  // remains the fallback; inspector.html would replace protocol hover.
+  const frontend = manifest
+    ? `http://127.0.0.1:${debugPort}/devtools/devtools_app.html?ws=127.0.0.1:${debugPort}/devtools/page/gea`
+    : `devtools://devtools/bundled/devtools_app.html?ws=127.0.0.1:${debugPort}/devtools/page/gea`
+  const sessions = new Set()
+  // A private host session reads and replays edits for the shared history.
+  const host = new DeviceSession(transport)
+  const changes = new Changes(
+    {
+      sync: () => host.refresh(),
+      async call(method, params) {
+        if (/^(DOM\.(getAttributes|describeNode)|CSS\.getStyleSheetText)$/.test(method))
+          await host.refresh()
+        return host.handle(method, params)
+      },
+      broadcast(method, params) {
+        for (const session of sessions) session.emit(method, params)
+      },
+    },
+    { app: title },
+  )
   const target = {
     id: 'gea',
     type: 'page',
@@ -1268,12 +1510,35 @@ export async function createDeviceRelay({
     try {
       if (
         ![`127.0.0.1:${debugPort}`, `localhost:${debugPort}`].includes(req.headers.host) ||
-        req.method !== 'GET' ||
+        !(req.method === 'GET' ||
+          (req.method === 'POST' && ['/preview/inspect', '/gea/changes'].includes(req.url))) ||
         req.headers['sec-fetch-site'] === 'cross-site' ||
         (req.headers.origin && req.headers.origin !== `http://127.0.0.1:${debugPort}`)
       ) {
         res.statusCode = 403
         res.end('Local preview access only')
+        return
+      }
+      if (await serveChanges(req, res, changes)) return
+      if (await serveFrontend(req, res, manifest)) return
+      if (req.method === 'POST') {
+        if (req.headers['content-type']?.split(';')[0] !== 'application/json')
+          throw new Error('Picker requests require JSON')
+        let body = ''
+        for await (const chunk of req) {
+          body += chunk.toString()
+          if (Buffer.byteLength(body) > 1024) throw new Error('Picker request exceeds limit')
+        }
+        const request = JSON.parse(body)
+        if (request.mode === 'cancel') {
+          const inspection = transport.inspection
+          if (!inspection || request.token !== inspection.token)
+            throw new Error('Element picker is no longer active')
+          await transport.cancelInspect(inspection.owner)
+          inspection.owner.emit('Overlay.inspectModeCanceled', {})
+        } else await transport.inspectPoint(request)
+        res.setHeader('Content-Type', 'application/json')
+        res.end('{}')
         return
       }
       if (req.url === '/preview/fonts.css') {
@@ -1318,7 +1583,10 @@ export async function createDeviceRelay({
           JSON.stringify({
             ...snapshot,
             nodes: [...snapshot.nodes.values()],
-            highlight: transport.highlight || 0,
+            highlight: transport.inspection ? snapshot.inspect?.hover || 0 : transport.highlight || 0,
+            inspectToken: !transport.debuggerState?.paused && transport.inspection &&
+              snapshot.inspect?.active && snapshot.inspect.token === transport.inspection.token
+                ? transport.inspection.token : 0,
             paused: !!transport.debuggerState?.paused,
           }),
         )
@@ -1347,7 +1615,6 @@ export async function createDeviceRelay({
     }
   })
   const wss = new WebSocketServer({ noServer: true, maxPayload: 65536 })
-  const sessions = new Set()
   server.on('upgrade', (req, socket, head) => {
     if (
       req.url !== '/devtools/page/gea' ||
@@ -1422,7 +1689,7 @@ export async function createDeviceRelay({
       queue = queue
         .then(async () => {
           try {
-            send({ id: request.id, result: await session.handle(request.method, request.params) })
+            send({ id: request.id, result: await route(session, request.method, request.params || {}) })
           } catch (e) {
             if (process.env.GEA_DEBUGGER_TRACE === '1')
               console.error('CDP request error', request.method, e.message)
@@ -1472,12 +1739,33 @@ export async function createDeviceRelay({
       clearInterval(timer)
       transport.debuggerState?.detach(session)
       transport.clearHighlight(session).catch(() => {})
+      transport.cancelInspect(session).catch(() => {})
       sessions.delete(session)
       session.objects.clear()
     })
     ws.on('error', () => ws.close())
   })
+  // History, outerHTML and undo are host features layered over the session.
+  const historyCommands = new Set(['getChanges', 'undo', 'redo', 'revert', 'exportOverrides', 'exportCss', 'applyOverrides'])
+  const route = async (session, method, params) => {
+    const compat = compatResult(method)
+    if (compat) return compat
+    if (method.startsWith('Gea.') && historyCommands.has(method.slice(4)))
+      return changes.command(method.slice(4), params)
+    if (method === 'DOM.undo' || method === 'DOM.redo') {
+      await changes[method === 'DOM.undo' ? 'undo' : 'redo']()
+      return {}
+    }
+    if (method === 'DOM.getOuterHTML') {
+      await session.refresh()
+      return { outerHTML: outerHTML(session.node(params.nodeId || params.backendNodeId, -1)) }
+    }
+    if (RECORDED_METHODS.has(method) && !transport.debuggerState?.paused)
+      return changes.record(method, params, () => session.handle(method, params))
+    return session.handle(method, params)
+  }
   const highlightHeartbeat = setInterval(() => {
+    transport.keepInspectAlive()?.catch(() => {})
     if (transport.highlight)
       transport
         .setHighlight(transport.highlight, transport.highlightColor, transport.highlightOwner)
@@ -1493,9 +1781,12 @@ export async function createDeviceRelay({
     frontend,
     preview,
     transport,
+    changes,
     async close() {
       clearInterval(highlightHeartbeat)
       await transport.debuggerState?.close()
+      await transport.elfLines?.close()
+      await transport.cancelInspect().catch(() => {})
       await transport.clearHighlight().catch(() => {})
       for (const ws of wss.clients) ws.terminate()
       wss.close()
@@ -1515,9 +1806,13 @@ export async function launchDeviceDebugger({
   debugPort = 9222,
   debugFps = 0,
   nativeDebug,
+  listenerSources,
   stdout = console.log,
   open = true,
+  overrides,
+  saveOverrides,
 }) {
+  const frontend = open ? await bundledFrontend({ env, stdout }) : undefined
   const relay = await createDeviceRelay({
     serial,
     screenshot,
@@ -1525,7 +1820,9 @@ export async function launchDeviceDebugger({
     title,
     debugFps,
     nativeDebug,
+    listenerSources,
     appRoot,
+    frontend,
   })
   let browser
   let stopped = false
@@ -1542,6 +1839,7 @@ export async function launchDeviceDebugger({
   process.once('SIGINT', stop)
   process.once('SIGTERM', stop)
   try {
+    if (overrides) await loadOverridesFile(relay.changes, overrides, stdout)
     stdout(`Device CDP: ${relay.endpoint}`)
     stdout(`Device preview: ${relay.preview}`)
     stdout('Console JavaScript runs on the host; tree/style mutations run on the device.')
@@ -1604,6 +1902,10 @@ export async function launchDeviceDebugger({
     serial.port.removeListener('close', stop)
     serial.port.removeListener('error', stop)
     if (browser && browser.exitCode === null) browser.kill('SIGTERM')
+    if (saveOverrides)
+      await saveOverridesFile(relay.changes, saveOverrides, stdout).catch((error) =>
+        stdout(`Cannot save overrides: ${error.message}`),
+      )
     await relay.close()
     await serial.close()
   }

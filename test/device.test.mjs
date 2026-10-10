@@ -1,6 +1,18 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { createServer } from 'node:net'
 import { DeviceSession, DeviceTransport, snapshotChecksum } from '../src/device.mjs'
+
+// A fixed port collides with whatever else holds it, such as another suite
+// running beside this one; take one the system says is free.
+const freePort = () =>
+  new Promise((resolve, reject) => {
+    const server = createServer().on('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address()
+      server.close(() => resolve(port))
+    })
+  })
 
 function framed(nodes, sequence, boot = 1) {
   const payload = nodes.map((n) => JSON.stringify(n))
@@ -75,8 +87,13 @@ function fixture() {
       const node = nodes.get(operation.id)
       if (!node) throw new Error('stale native identity')
       if (operation.op === 'style') {
-        node.inline[operation.key] = operation.value
-        node.computed[operation.key] = operation.value
+        if (operation.value) {
+          node.inline[operation.key] = operation.value
+          node.computed[operation.key] = operation.value
+        } else {
+          delete node.inline[operation.key]
+          delete node.computed[operation.key]
+        }
       }
       if (operation.op === 'text') node.text = operation.value
       if (operation.op === 'attribute') node.attributes[operation.key] = operation.value
@@ -93,6 +110,152 @@ function fixture() {
     },
   }
 }
+
+function pickerFirmware() {
+  const state = { token: 0, active: false, hover: 0, node: 0, revision: 0 }
+  const operations = []
+  const nodes = [
+    { id: 4, parent: 2, tag: 'div', attributes: {}, children: [6], text: '', inline: {}, computed: {}, x: 0, y: 0, width: 410, height: 502 },
+    { id: 6, parent: 4, tag: 'div', attributes: {}, children: [8], text: '', inline: {}, computed: {}, x: 0, y: 0, width: 200, height: 100 },
+    { id: 8, parent: 6, tag: 'button', attributes: { id: 'native-button' }, children: [], text: 'Pick me', inline: {}, computed: {}, x: 10, y: 10, width: 100, height: 20 },
+  ]
+  let capability = true
+  const serial = {
+    async collect(command) {
+      const frame = framed(nodes, Number(command.split(' ').at(-1)))
+      frame.end += capability ? ` picker=1 overlay=1 inspectToken=${state.token} inspectActive=${+state.active} inspectHover=${state.hover} inspectNode=${state.node} inspectRevision=${state.revision}` : ''
+      return frame
+    },
+    async command(command) {
+      const operation = JSON.parse(Buffer.from(command.split(' ').at(-1), 'base64').toString())
+      operations.push(operation)
+      assert.equal(operation.boot, '1')
+      if (operation.op === 'inspect') {
+        if (operation.mode.startsWith('search')) {
+          Object.assign(state, { token: operation.token, active: true, hover: 0, node: 0 })
+        } else if (operation.mode === 'none' && operation.token === state.token)
+          Object.assign(state, { active: false, hover: 0, node: 0 })
+      }
+      if (operation.op === 'inspectPoint' && operation.token === state.token && state.active) {
+        state.hover = operation.mode === 'leave' ? 0 : 8
+        if (operation.mode === 'select') {
+          state.active = false
+          state.node = 8
+          state.revision++
+        }
+      }
+      return 'GEADEV:DEBUG OK id=0'
+    },
+  }
+  return { serial, state, operations, nodes, legacy() { capability = false } }
+}
+
+test('device picker publishes collapsed ancestors before selecting a native lifetime once', async () => {
+  const firmware = pickerFirmware(), transport = new DeviceTransport(firmware.serial), events = []
+  const session = new DeviceSession(transport, (method, params) => events.push({ method, params }))
+  await session.refresh()
+  await session.handle('DOM.enable')
+  await session.handle('DOM.getDocument', { depth: 1 })
+  await session.handle('Overlay.setInspectMode', { mode: 'searchForNode' })
+  const token = transport.inspection.token
+  await transport.inspectPoint({ token, mode: 'hover', x: 15, y: 15 })
+  assert.ok(events.some(event => event.method === 'Overlay.nodeHighlightRequested' && event.params.nodeId === 8))
+  await transport.inspectPoint({ token, mode: 'select', x: 15, y: 15 })
+  assert.equal(session.selected, 8)
+  assert.equal(transport.inspection, null)
+  const selected = events.findIndex(event => event.method === 'Overlay.inspectNodeRequested')
+  assert.deepEqual(events[selected].params, { backendNodeId: 8 })
+  for (const parentId of [2, 4, 6]) {
+    const published = events.findIndex(event => event.method === 'DOM.setChildNodes' && event.params.parentId === parentId)
+    assert.ok(published >= 0 && published < selected)
+  }
+  await session.refresh(true)
+  assert.equal(events.filter(event => event.method === 'Overlay.inspectNodeRequested').length, 1)
+  assert.ok(firmware.operations.every(op => !['click', 'style', 'attribute'].includes(op.op)))
+  await assert.rejects(transport.inspectPoint({ token, mode: 'select', x: 15, y: 15 }), /no longer active/)
+})
+
+test('inspect ownership isolates cancellation, stale snapshots and recycled nodes', async () => {
+  const firmware = pickerFirmware(), transport = new DeviceTransport(firmware.serial), firstEvents = [], secondEvents = []
+  const first = new DeviceSession(transport, (method, params) => firstEvents.push({ method, params }))
+  const second = new DeviceSession(transport, (method, params) => secondEvents.push({ method, params }))
+  await first.refresh(); await second.refresh()
+  await first.handle('Overlay.setInspectMode', { mode: 'searchForNode' })
+  const stale = transport.inspection.token
+  await second.handle('Overlay.setInspectMode', { mode: 'searchForUAShadowDOM' })
+  const token = transport.inspection.token
+  assert.ok(firstEvents.some(event => event.method === 'Overlay.inspectModeCanceled'))
+  await first.handle('Overlay.setInspectMode', { mode: 'none' })
+  assert.equal(transport.inspection.token, token)
+  first.updateInspection({ token: stale, active: false, node: 8 })
+  second.updateInspection({ token: stale, active: false, node: 8 })
+  assert.ok(!firstEvents.concat(secondEvents).some(event => event.method === 'Overlay.inspectNodeRequested'))
+  firmware.state.active = false
+  firmware.state.node = 42 // Removed lifetime, even if its engine slot is reused.
+  await transport.snapshot({ fresh: true }); await second.refresh(true)
+  assert.ok(secondEvents.some(event => event.method === 'Overlay.inspectModeCanceled'))
+  assert.equal(transport.inspection, null)
+  await second.handle('Overlay.setInspectMode', { mode: 'searchForNode' })
+  await second.handle('Overlay.disable')
+  assert.equal(firmware.state.active, false)
+})
+
+test('legacy firmware refuses the picker without sending a device mutation', async () => {
+  const firmware = pickerFirmware(); firmware.legacy()
+  const transport = new DeviceTransport(firmware.serial), session = new DeviceSession(transport)
+  await session.refresh()
+  await assert.rejects(session.handle('Overlay.setInspectMode', { mode: 'searchForNode' }), /fresh debug firmware/)
+  await assert.rejects(session.handle('Overlay.setInspectMode', { mode: 'captureAreaScreenshot' }), /Unsupported inspect/)
+  assert.deepEqual(firmware.operations, [])
+})
+
+test('both preview modes pick through CDP and disconnect releases the device owner', async () => {
+  const { createDeviceRelay } = await import('../src/device.mjs')
+  const { connectCDP } = await import('../src/cdp.mjs')
+  const firmware = pickerFirmware()
+  const port = await freePort()
+  const relay = await createDeviceRelay({ serial: firmware.serial, debugPort: port, pollMs: 25 })
+  let cdp
+  try {
+    cdp = await connectCDP(relay.endpoint)
+    const selected = []
+    cdp.onEvent(event => {
+      if (event.method === 'Overlay.inspectNodeRequested') selected.push(event.params.backendNodeId)
+    })
+    await cdp.send('DOM.enable')
+    await cdp.send('DOM.getDocument', { depth: 1 })
+    const base = `http://127.0.0.1:${port}`
+    for (const mode of ['screen', 'dom']) {
+      await cdp.send('Overlay.setInspectMode', { mode: 'searchForNode' })
+      const snapshot = await (await fetch(base + '/preview/snapshot')).json()
+      assert.ok(snapshot.inspectToken)
+      const response = await fetch(base + '/preview/inspect', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: snapshot.inspectToken, mode: 'select', x: 15, y: 15 }),
+      })
+      assert.equal(response.status, 200, mode)
+      assert.deepEqual(selected, mode === 'screen' ? [8] : [8, 8])
+    }
+    await cdp.send('Overlay.setInspectMode', { mode: 'searchForNode' })
+    const token = relay.transport.inspection.token
+    assert.equal((await fetch(base + '/preview/inspect', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Origin: 'https://example.com' },
+      body: JSON.stringify({ token, mode: 'select', x: 15, y: 15 }),
+    })).status, 403)
+    assert.equal((await fetch(base + '/preview/inspect', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token, mode: 'hover', x: 10000, y: 15 }),
+    })).status, 503)
+    await cdp.send('Overlay.setInspectMode', { mode: 'none' })
+    assert.equal(firmware.state.active, false)
+    await cdp.send('Overlay.setInspectMode', { mode: 'searchForNode' })
+    cdp.close()
+    for (let attempt = 0; attempt < 100 && firmware.state.active; attempt++)
+      await new Promise(resolve => setTimeout(resolve, 10))
+    assert.equal(firmware.state.active, false)
+    assert.equal(relay.transport.inspection, null)
+  } finally { cdp?.close(); await relay.close() }
+})
 
 test('host console reads device snapshot and sends native operations before replying', async () => {
   const transport = fixture()
@@ -296,7 +459,7 @@ test('device relay accepts Chrome startup request bursts without disconnecting',
       return framed([node], Number(line.split(' ').at(-1)))
     },
   }
-  const relay = await createDeviceRelay({ serial, debugPort: 15987 })
+  const relay = await createDeviceRelay({ serial, debugPort: await freePort() })
   let cdp
   try {
     cdp = await connectCDP(relay.endpoint)
@@ -347,7 +510,7 @@ test('concurrent inspectors share a snapshot and mutations invalidate the cached
   assert.equal(calls, 2)
 })
 
-test('CSS shorthand editing returns canonical native ranges so subsequent edits stay valid', async () => {
+test('CSS shorthand editing keeps authored text and stable ranges after engine expansion', async () => {
   const transport = fixture()
   const original = transport.mutate
   transport.mutate = async (operation) => {
@@ -370,7 +533,8 @@ test('CSS shorthand editing returns canonical native ranges so subsequent edits 
       ],
     })
     style = result.styles[0]
-    assert.match(style.cssText, new RegExp('background-color: ' + color))
+    assert.equal(style.cssText, 'background: ' + color + ';')
+    assert.deepEqual(style.cssProperties.map(p => p.name), ['background'])
     assert.equal(style.range.endColumn, style.cssText.length)
   }
   await assert.rejects(
@@ -449,7 +613,8 @@ test('authored native rules have editable sheets/ranges and edits update the cas
   })
   assert.equal(values.background, 'blue')
   assert.equal(result.styles[0].cssProperties.find((p) => p.name === 'background').value, 'blue')
-  assert.equal(ops.length, 2)
+  assert.ok(ops.every(op => op.op === 'rule'), 'authored edits never write inline styles')
+  assert.equal(values['font-size'], '26vmin', 'unmodified declaration survives replacement')
   assert.equal(
     (await session.handle('CSS.getInlineStylesForNode', { nodeId: 6 })).inlineStyle.cssText,
     '',
@@ -458,6 +623,94 @@ test('authored native rules have editable sheets/ranges and edits update the cas
     (await session.handle('CSS.getStyleSheetText', { styleSheetId: rule.styleSheetId })).text,
     result.styles[0].cssText,
   )
+  let authored = result.styles[0]
+  for (let attempt = 0; attempt < 3; attempt++) {
+    for (const disabled of [true, false]) {
+      const color = authored.cssProperties.find(p => p.name === 'color')
+      authored = (await session.handle('CSS.setStyleTexts', { edits: [{
+        styleSheetId: authored.styleSheetId, range: color.range,
+        text: disabled ? '/* color: red; */' : 'color: red;',
+      }] })).styles[0]
+      await session.refresh(true)
+      assert.equal(values.color, disabled ? undefined : 'red')
+      assert.equal(values.background, 'blue', 'other author declarations remain enabled')
+      assert.equal(authored.cssProperties.find(p => p.name === 'color').disabled, disabled)
+      const reconnected = new DeviceSession(transport)
+      await reconnected.refresh()
+      assert.equal((await reconnected.handle('CSS.getMatchedStylesForNode', { nodeId: 6 }))
+        .matchedCSSRules[0].rule.style.cssText, authored.cssText)
+    }
+  }
+})
+
+test('console property writes and cssText replacements keep their order without inventing declarations', async () => {
+  const transport = fixture(), session = new DeviceSession(transport)
+  await session.refresh()
+  const result = await session.handle('Runtime.evaluate', { expression: `
+    const node = document.querySelector('.status');
+    node.style.color = 'red';
+    node.style.cssText = 'background: blue; /* opacity: .5; */';
+    node.style.color = 'lime';
+    node.style.removeProperty('background');
+    node.style.cssText;
+  `, returnByValue: true })
+  assert.equal(result.exceptionDetails, undefined)
+  const style = (await session.handle('CSS.getInlineStylesForNode', { nodeId: 6 })).inlineStyle
+  assert.equal(style.cssText, result.result.value)
+  assert.deepEqual(style.cssProperties.map(p => [p.name, p.disabled]), [['opacity', true], ['color', false]])
+  assert.deepEqual((await transport.snapshot()).nodes.get(6).inline, { color: 'lime' })
+})
+
+test('independent inline toggles preserve shorthand source across polling, runtime writes and reconnects', async () => {
+  const transport = fixture()
+  const mutate = transport.mutate
+  transport.mutate = operation => mutate({ ...operation,
+    key: operation.key === 'background' ? 'background-color' : operation.key })
+  let session = new DeviceSession(transport)
+  await session.refresh()
+  let style = (await session.handle('CSS.getInlineStylesForNode', { nodeId: 6 })).inlineStyle
+  style = (await session.handle('CSS.setStyleTexts', { edits: [{
+    styleSheetId: style.styleSheetId, range: style.range,
+    text: 'background: indianred;\ncolor: lime; opacity: .5;',
+  }] })).styles[0]
+  for (let attempt = 0; attempt < 3; attempt++) {
+    for (const disabled of [true, false]) {
+      for (const name of ['background', 'color']) {
+        const property = style.cssProperties.find(p => p.name === name)
+        style = (await session.handle('CSS.setStyleTexts', { edits: [{
+          styleSheetId: style.styleSheetId, range: property.range,
+          text: disabled ? `/* ${name}: ${property.value}; */` : `${name}: ${property.value};`,
+        }] })).styles[0]
+        await session.refresh(true)
+        style = (await session.handle('CSS.getInlineStylesForNode', { nodeId: 6 })).inlineStyle
+        assert.equal(style.cssProperties.find(p => p.name === name).disabled, disabled)
+        assert.deepEqual(style.cssProperties.map(p => p.name), ['background', 'color', 'opacity'])
+        const computed = (await session.handle('CSS.getComputedStyleForNode', { nodeId: 6 })).computedStyle
+        assert.equal(computed.find(p => p.name === (name === 'background' ? 'background-color' : name))?.value,
+          disabled ? undefined : property.value)
+      }
+    }
+  }
+  const opacity = style.cssProperties.find(p => p.name === 'opacity')
+  style = (await session.handle('CSS.setStyleTexts', { edits: [{
+    styleSheetId: style.styleSheetId, range: opacity.range, text: '/* opacity: .5; */',
+  }] })).styles[0]
+  session = new DeviceSession(transport)
+  await session.refresh()
+  assert.equal((await session.handle('CSS.getInlineStylesForNode', { nodeId: 6 })).inlineStyle.cssText,
+    style.cssText, 'transport owns authored state across inspector sessions')
+  const result = await session.handle('Runtime.evaluate', {
+    expression: 'document.querySelector(".status").style.background="blue"',
+  })
+  assert.equal(result.exceptionDetails, undefined)
+  style = (await session.handle('CSS.getInlineStylesForNode', { nodeId: 6 })).inlineStyle
+  assert.deepEqual(style.cssProperties.map(p => p.name), ['background', 'color', 'opacity'])
+  assert.equal(style.cssProperties.find(p => p.name === 'opacity').disabled, true)
+  assert.equal(style.cssProperties.find(p => p.name === 'background').value, 'blue')
+  await transport.mutate({ op: 'style', id: 6, key: 'left', value: '42px' })
+  await session.refresh()
+  assert.equal((await session.handle('CSS.getInlineStylesForNode', { nodeId: 6 }))
+    .inlineStyle.cssProperties.find(p => p.name === 'left').value, '42px', 'app-driven updates remain live')
 })
 
 test('native inline declarations appear as live style attributes and attribute edits use the native style API', async () => {
@@ -487,8 +740,8 @@ test('native inline declarations appear as live style attributes and attribute e
   assert.equal(
     (
       await session.handle('CSS.getInlineStylesForNode', { nodeId: 6 })
-    ).inlineStyle.cssProperties.find((property) => property.name === 'left')?.value,
-    '',
+    ).inlineStyle.cssProperties.find((property) => property.name === 'left'),
+    undefined,
   )
   assert.ok(transport.operations.every((operation) => operation.op === 'style'))
 })
@@ -513,7 +766,7 @@ test('preview modes share captures, retain paused pixels and reject cross-site r
   let captures = 0
   const relay = await createDeviceRelay({
     serial: { collect: async (line) => framed([node], Number(line.split(' ').at(-1))) },
-    debugPort: 15988,
+    debugPort: await freePort(),
     screenshot: async () => {
       captures++
       await new Promise((r) => setTimeout(r, 20))
@@ -632,4 +885,121 @@ test('hover bursts coalesce to the latest highlight; paused changes wait for res
   transport.debuggerState.paused = false
   await transport.flushHighlight()
   assert.equal(writes.at(-1).id, 0)
+})
+
+test('device relay records edits into the shared history and undoes them on the device', async () => {
+  const { createDeviceRelay } = await import('../src/device.mjs')
+  const { connectCDP } = await import('../src/cdp.mjs')
+  const firmware = pickerFirmware()
+  const command = firmware.serial.command
+  firmware.serial.command = async (line) => {
+    const reply = await command(line)
+    const operation = firmware.operations.at(-1)
+    const node = firmware.nodes.find((candidate) => candidate.id === operation.id)
+    if (operation.op === 'attribute') node.attributes[operation.key] = operation.value
+    if (operation.op === 'removeAttribute') delete node.attributes[operation.key]
+    return reply
+  }
+  const port = await freePort()
+  const relay = await createDeviceRelay({ serial: firmware.serial, debugPort: port, pollMs: 25, frontend: null })
+  let first, second
+  try {
+    first = await connectCDP(relay.endpoint)
+    second = await connectCDP(relay.endpoint)
+    await first.send('DOM.getDocument', { depth: -1 })
+    assert.deepEqual(await first.send('Overlay.setShowPaintRects', { result: true }), {})
+    await first.send('DOM.setAttributeValue', { nodeId: 8, name: 'data-x', value: '1' })
+    const { entries } = await second.send('Gea.getChanges')
+    assert.equal(entries[0].ops[0].target, 'button#native-button')
+    assert.equal(
+      (await second.send('DOM.getOuterHTML', { nodeId: 8 })).outerHTML,
+      '<button id="native-button" data-x="1">Pick me</button>',
+    )
+    await second.send('DOM.undo')
+    assert.equal(firmware.nodes[2].attributes['data-x'], undefined)
+    assert.deepEqual(firmware.operations.filter((o) => o.op.endsWith('ttribute')).map((o) => o.op), ['attribute', 'removeAttribute'])
+    const response = await fetch(`http://127.0.0.1:${port}/gea/changes`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ method: 'redo' }),
+    })
+    assert.equal((await response.json()).overrides, 1)
+    assert.equal(firmware.nodes[2].attributes['data-x'], '1')
+  } finally {
+    first?.close()
+    second?.close()
+    await relay.close()
+  }
+})
+
+test('console inspect() reveals a board node in Elements', async () => {
+  const events = []
+  const session = new DeviceSession(fixture(), (method, params) => events.push({ method, params }))
+  await session.refresh()
+  await session.handle('Runtime.enable')
+  await session.handle('Runtime.evaluate', { expression: 'inspect($(".status"))' })
+  const request = events.find((event) => event.method === 'Runtime.inspectRequested')
+  assert.equal(request.params.object.subtype, 'node')
+  assert.deepEqual(await session.handle('DOM.requestNode', { objectId: request.params.object.objectId }), { nodeId: 6 })
+})
+
+test('board event listeners come from firmware call sites and link to mapped source', async () => {
+  const { StaticSources } = await import('../src/gdb.mjs')
+  const firmware = pickerFirmware()
+  const collect = firmware.serial.collect
+  const requests = []
+  firmware.serial.collect = async (command, options) => {
+    if (!command.startsWith('GEADEV DEBUG LISTENERS ')) {
+      const frame = await collect(command, options)
+      frame.end += ' listeners=1'
+      return frame
+    }
+    const [, , , sequence, list] = command.split(' ')
+    requests.push(list)
+    const lines = list
+      .split(',')
+      .map(Number)
+      .filter((id) => id === 6 || id === 8)
+      .map((id) => `GEADEV:DEBUG LISTENER ${JSON.stringify({ id, type: 'click', sites: id === 8 ? [0x4200, 0x4300] : [0x4200] })}`)
+    return { lines: [...lines, `GEADEV:DEBUG LISTENERS END sequence=${sequence} count=${lines.length} boot=1`], end: `GEADEV:DEBUG LISTENERS END sequence=${sequence} count=${lines.length} boot=1` }
+  }
+  const transport = new DeviceTransport(firmware.serial)
+  transport.elfLines = {
+    async locations(addresses) {
+      assert.deepEqual([...new Set(addresses)].sort(), [0x4200, 0x4300])
+      return { [0x4200]: { functionName: 'gea::jsx::bindNodeListener' }, [0x4300]: { scriptId: 'native-app', lineNumber: 4, columnNumber: 0, functionName: 'gea_body_fn' } }
+    },
+  }
+  const session = new DeviceSession(transport)
+  await session.refresh()
+  const object = (await session.handle('Runtime.evaluate', { expression: '$("#native-button")' })).result
+  assert.equal(object.description, 'button#native-button')
+  const own = (await session.handle('DOMDebugger.getEventListeners', { objectId: object.objectId })).listeners
+  assert.equal(requests.at(-1), '8')
+  assert.equal(own.length, 1)
+  assert.equal(own[0].scriptId, 'native-app')
+  assert.equal(own[0].lineNumber, 4)
+  assert.equal(own[0].handler.description, 'click listener on <button>')
+  assert.match(own[0].handler.objectId, /^gea-listener-/)
+  assert.equal(own[0].backendNodeId, 8)
+
+  const root = (await session.handle('Runtime.evaluate', { expression: 'document.body' })).result
+  const all = (await session.handle('DOMDebugger.getEventListeners', { objectId: root.objectId, depth: -1 })).listeners
+  assert.equal(requests.at(-1), '4,6,8')
+  // Only runtime frames: listed, named, but without a source link.
+  const unmapped = all.find((listener) => listener.backendNodeId === 6)
+  assert.equal(unmapped.scriptId, '')
+  assert.equal(unmapped.handler.description, 'click listener on <div> · gea::jsx::bindNodeListener')
+
+  firmware.serial.collect = collect
+  transport.cached = null
+  await assert.rejects(session.handle('DOMDebugger.getEventListeners', { objectId: object.objectId }), /cannot report event listeners/)
+
+  // Without JTAG, the read-only Sources view still publishes the mapped script.
+  const sources = new StaticSources({ file: 'gea-native-debug.js', locations: [] })
+  const parsed = []
+  assert.deepEqual(await sources.handle(null, (method, params) => parsed.push([method, params]), 'Debugger.enable'), { debuggerId: 'gea-native-sources' })
+  assert.equal(parsed[0][1].scriptId, 'native-app')
+  await assert.rejects(sources.handle(null, () => {}, 'Debugger.setBreakpointByUrl', {}), /--debug-sources/)
+  assert.equal(await sources.handle(null, () => {}, 'Runtime.evaluate', {}), undefined)
 })

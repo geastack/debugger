@@ -45,7 +45,9 @@ The Mac command builds a native `.app`, launches its window and opens DevTools
 against its actual Gea tree. It requires a Mac, Apple command-line tools and
 `@geastack/apple` installed in the app's dependency tree. A declared macOS target
 is not required for this debug build. Inspect nodes, edit inline styles and
-run Console scripts; macOS source stepping is not implemented.
+run Console scripts. Sources shows original TS/TSX files with breakpoints and
+Step Over/Into/Out through Xcode's LLDB. Mac debug builds use full symbols and
+disable optimization; `--no-debug-sources` keeps only tree/style inspection.
 This compiled macOS backend hosts Gea's UI in AppKit. Direct UIKit/Apple-native
 widget trees are not supported by the debugger bridge.
 
@@ -73,9 +75,11 @@ inspects the browser mirror. Ctrl-C closes the relay and its owned processes.
 | --- | --- |
 | `--debug-fps 10` | Cap board rendering; accepts 1–120 FPS. |
 | `--attach` | Reuse existing debug firmware and its matching build output. |
-| `--debug-sources` | Explicitly start ESP32-S3 USB JTAG for breakpoints and stepping. |
+| `--debug-sources` | Enable source debugging. Default on macOS; explicit opt-in to ESP32-S3 USB JTAG. |
 | `--no-open` | Expose the debugger without opening Chrome. |
 | `--debug-port 9223` | Change the CDP and preview port. |
+| `--overrides edits.json` | Apply saved Gea Changes overrides once the debugger attaches (macOS and ESP32). |
+| `--save-overrides edits.json` | Write the session's net edits to a file when the debugger exits. |
 
 Default endpoints: [preview](http://127.0.0.1:9222/preview),
 [discovery](http://127.0.0.1:9222/json/list), and
@@ -87,10 +91,59 @@ serial monitor before retrying. A hidden DevTools window can still have a runnin
 ## Inspect and edit
 
 **Elements** shows nodes, text, attributes, native bounds and computed styles.
-ESP32 also exposes live inline `style` attributes and supports editing authored
-class rules as well as inline styles. Changes affect the running app and may be
-overwritten by app code; they do not save to source. Native macOS supports inline edits and
-highlights element bounds in its window.
+Native macOS and ESP32 support editing authored class rules and inline styles,
+including individual declaration checkboxes. Changes affect the running app and
+may be overwritten by app code; they do not save to source. Copy outerHTML
+serializes the native subtree.
+
+Native targets open a pinned DevTools frontend served by the relay. It adds a
+**Gea Changes** panel and UI zoom (⌘+/⌘−/⌘0, Ctrl on other platforms), and it
+remembers the zoom level. The first run downloads the pinned frontend into
+`.build/devtools`; published packages already include it. If the download fails,
+or `GEA_DEBUGGER_FRONTEND=builtin` is set, Chrome's own frontend opens without
+these additions.
+
+### Gea Changes
+
+Style, attribute and text edits from every connected DevTools window form one
+shared history. Undo and Redo work from the panel or with ⌘Z/⌘⇧Z in Elements.
+"Undo this change" reverts one edit out of order. Undo refuses to overwrite a
+value that app code or another edit changed afterwards. The panel shows each
+edit as a declaration or value diff against its target: a rule selector, an
+element id or a classed child path.
+
+**Save overrides** downloads the net edits as `gea-overrides.json`, and **Export
+CSS** writes them as a stylesheet you can copy into source. **Load overrides**
+replays a saved file into the running app as a single undoable transaction. A
+loaded file applies all of its edits or none: every target is resolved before
+anything is written. Elements are matched by a unique `id` when they have one,
+otherwise by child path and tag. Pass the same files from the CLI with
+`--overrides` and `--save-overrides` to reapply your edits on every launch.
+
+### Event Listeners
+
+The Event Listeners sidebar lists the handlers that Gea's JSX attached to the
+selected element and its ancestors. Each handler links to the TSX line that
+registered it. Listeners cannot be removed or toggled from DevTools.
+
+On macOS, `getEventListeners($0)` returns the same list in the Console. On
+ESP32-S3, debug firmware records the call stack of each registration, and the
+host resolves it against the matching local ELF with GDB. This works without
+USB JTAG: without `--debug-sources`, Sources shows the original code read-only
+and can't set breakpoints. Firmware built before listener support needs one
+rebuild. Other ESP32 chips list listeners without source links.
+
+On macOS, enable the element picker in DevTools (⌘⇧C), then click directly in the
+native app window. Hover highlights the element, and a click selects it in
+Elements without activating its control. Escape cancels picking. Disconnecting
+DevTools restores normal app input.
+
+On ESP32, enable the same picker, then tap an element on the board or click it
+in either preview mode. The board's native hit test chooses the element; the
+tap selects it without triggering app handlers. Escape in DevTools or the
+preview cancels picking. Disconnecting restores input, and a short lease also
+restores it if the host exits abruptly. Existing debug firmware needs rebuilding
+to add picking; normal builds contain no picker.
 
 **Console** exposes `document`, `$`, `$$`, `$0`, `getComputedStyle`, tree mutations
 and compiled click handlers:
@@ -108,6 +161,13 @@ inspector uses JavaScriptCore. Selectors support tags, classes, IDs, `body` and 
 
 ## Source debugging
 
+On macOS, `gea run --debug --target macos` enables source debugging automatically.
+Open a TS/TSX file in Sources, set a line or inline breakpoint, and trigger its
+action in the Mac window. DevTools pauses the compiled app and supports
+Pause/Resume and Step Over/Into/Out. LLDB uses software breakpoints, without the
+board's two-slot limit. Stepping skips unmapped C++ helpers; Step Out can land in
+a native caller after leaving app code. Scope values can be expanded.
+
 Add `--debug-sources` on ESP32-S3 debug builds for original TS/TSX source maps,
 line/column hardware breakpoints, Pause/Resume and Step Over/Into/Out.
 ESP-IDF's OpenOCD and Xtensa GDB use built-in USB JTAG. The relay verifies that the ELF matches the running
@@ -119,9 +179,12 @@ to local build output; it does not determine whether firmware supports debugging
 The chip has two hardware breakpoint slots. Stepping temporarily reserves a slot
 and skips helpers without app source mappings. Scope shows generated C++ locals;
 paused-frame evaluation accepts native C++ expressions such as `6 * 7`.
-Original variable names, JavaScript conditional breakpoints, exception pausing,
-live source replacement and macOS source stepping are not implemented. Pause
-preserves the last tree snapshot; resume before editing the tree or styles.
+Both native backends show generated C++ locals, and paused evaluation accepts
+native C++ expressions rather than JavaScript. Original variable names,
+JavaScript conditional breakpoints, exception pausing and live source replacement
+are not implemented. Pause preserves the last inspected tree; resume before
+reading new UI state or editing the tree and styles. Disconnecting the last Mac
+source-debugger client removes its breakpoints and resumes the app.
 
 Tree/style inspection does not start OpenOCD/GDB by default. `--debug-sources`
 or `GEA_DEBUGGER_JTAG=1` opts into USB JTAG; `--no-debug-sources` overrides the
@@ -148,7 +211,8 @@ unchanged, follows motion and clears on hover-out or disconnect. A short device
 lease also clears it after an abrupt host exit. Native highlights update after
 resume when the CPU is paused. Drawing the overlay requires full repaint while
 visible; use `--debug-fps 10` or `30` to leave room for inspection.
-Preview click/touch forwarding is not implemented.
+Preview clicks select elements while DevTools' picker is enabled. Forwarding
+ordinary preview clicks as app input is not implemented.
 
 ## Library and development
 
@@ -159,9 +223,14 @@ Gea's framed `GEADEV DEBUG` protocol; this package does not include firmware.
 
 ```sh
 npm ci
+npm run build:frontend
 npm run check
 npm test
 ```
+
+`npm run build:frontend` downloads the Chromium DevTools frontend at the
+revision in `frontend/pin.json`. It checks each patched file against its pinned
+hash and then applies the Gea patches. `npm pack` runs it automatically.
 
 Unit tests run without hardware. Browser, native and board integration tests are
 opt-in; see [CONTRIBUTING.md](CONTRIBUTING.md) for their environment variables.

@@ -9,6 +9,7 @@ mode.value = localStorage.getItem('gea-preview-mode') === 'dom' ? 'dom' : 'scree
 let lastImage = '',
   lastCapture = 0,
   revision = 0
+let inspectToken = 0, picking = false, pendingPoint = null
 const elements = new Map()
 const properties = [
   'background-color',
@@ -125,12 +126,59 @@ function updateMode() {
 }
 mode.addEventListener('change', updateMode)
 updateMode()
+async function sendPoint(request) {
+  if (picking) { pendingPoint = request; return }
+  picking = true
+  try {
+    // Replace hover samples while USB is busy. Preserve a click or cancellation
+    // through its acknowledgement, rather than enqueueing every pointer move.
+    do {
+      pendingPoint = null
+      const response = await fetch('/preview/inspect', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(request),
+      })
+      if (!response.ok) throw Error((await response.json()).error)
+      if (request.mode === 'select' || request.mode === 'cancel') {
+        inspectToken = 0
+        pendingPoint = null
+      }
+      request = pendingPoint
+    } while (request && request.token === inspectToken)
+  } catch (error) { status.textContent = error.message }
+  finally { picking = false }
+}
+function point(event, kind) {
+  if (!inspectToken) return
+  event.preventDefault()
+  const bounds = screen.getBoundingClientRect()
+  sendPoint({ token: inspectToken, mode: kind,
+    x: Math.min(screen.clientWidth - 1, Math.max(0, Math.floor((event.clientX - bounds.left) * screen.clientWidth / bounds.width))),
+    y: Math.min(screen.clientHeight - 1, Math.max(0, Math.floor((event.clientY - bounds.top) * screen.clientHeight / bounds.height))),
+  })
+}
+screen.addEventListener('pointermove', event => {
+  if (!pendingPoint || pendingPoint.mode === 'hover') point(event, 'hover')
+})
+screen.addEventListener('click', event => point(event, 'select'))
+screen.addEventListener('pointerleave', () => {
+  if (inspectToken && (!pendingPoint || pendingPoint.mode === 'hover'))
+    sendPoint({ token: inspectToken, mode: 'leave' })
+})
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && inspectToken) {
+    event.preventDefault()
+    sendPoint({ token: inspectToken, mode: 'cancel' })
+  }
+})
 async function refresh() {
   const current = revision
   try {
     const response = await fetch('/preview/snapshot', { cache: 'no-store' })
     if (!response.ok) throw Error(await response.text())
     const snapshot = await response.json()
+    inspectToken = snapshot.inspectToken || 0
+    screen.style.cursor = inspectToken ? 'crosshair' : ''
     screen.style.width = `${snapshot.width}px`
     screen.style.height = `${snapshot.height}px`
     const needsPixels =
@@ -149,11 +197,12 @@ async function refresh() {
     render(snapshot)
     status.textContent = snapshot.paused
       ? 'Paused · last captured state'
+      : inspectToken ? 'Pick an element · tap the board or click this preview · Escape cancels'
       : `${mode.value === 'screen' ? 'Device display' : 'DOM mirror'} · connected`
   } catch (error) {
     status.textContent = error.message
   } finally {
-    setTimeout(refresh, mode.value === 'dom' ? 750 : 2000)
+    setTimeout(refresh, inspectToken ? 250 : 750)
   }
 }
 refresh()

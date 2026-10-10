@@ -15,6 +15,10 @@ use a development app and restart it afterward if necessary.
 | `test/device-preview.integration.test.mjs` | `GEA_DEBUGGER_PREVIEW_TEST_APP`, `GEA_DEBUGGER_PREVIEW_TEST_ENDPOINT` |
 | `test/device-source.integration.test.mjs` | `GEA_DEBUGGER_SOURCE_TEST_ENDPOINT`, `GEA_DEBUGGER_SOURCE_TEST_FILE` (original path suffix), `GEA_DEBUGGER_SOURCE_TEST_LINE` (1-based, recurring executable position) |
 
+The browser integration loads the app's declared fonts. Set
+`GEA_DEBUGGER_TEST_DENIED_FILE` to an existing file outside the app workspace
+to also verify the dev server rejects it with HTTP 403.
+
 For the source test, `GEA_DEBUGGER_SOURCE_TEST_COLUMN` is also 1-based; optional
 `GEA_DEBUGGER_SOURCE_TEST_APP` enables verification through Chrome's own Sources
 model. Frontend tests default to the macOS console context; set
@@ -23,6 +27,14 @@ Set `GEA_DEBUGGER_FRONTEND_TEST_HIGHLIGHT=1` with a visible class/id selector
 to verify real Elements mouse hover and leave against current board firmware.
 Screenshot output is optional in native/frontend tests through their
 `GEA_DEBUGGER_*_TEST_SCREENSHOT` variables; use an existing build output path.
+
+The bundled DevTools frontend is pinned in `frontend/pin.json`. To move the pin,
+update the revision and Chrome version. Rebuild with `npm run build:frontend`,
+and re-review every string replacement in `frontend/patches.mjs` against the
+new upstream files. Then record their new SHA-256 hashes and bump
+`patchVersion`. A hash mismatch stops the build rather than patching code that
+nobody reviewed. The Gea Changes panel (`frontend/gea-panels.mjs`) is served
+from source, so panel edits need only a reload.
 
 The host adapters live in `src/`, the debug-only AppKit bridge in `native/`.
 Keep app logic and fixtures out of production code. Preserve native lifetime IDs,

@@ -60,6 +60,18 @@ test(
         await new Promise((resolve) => setTimeout(resolve, 100))
       }
       assert.ok(rendered, 'Gea app rendered into #app')
+      const fonts = await cdp.send('Runtime.evaluate', {
+        expression: '(async()=>{await Promise.all([...document.fonts].map(font=>font.load())); return [...document.fonts].map(font=>font.status)})()',
+        awaitPromise: true,
+        returnByValue: true,
+      })
+      assert.equal(fonts.exceptionDetails, undefined, 'the real app font resources load')
+      assert.ok(fonts.result.value.every((status) => status === 'loaded'))
+      if (process.env.GEA_DEBUGGER_TEST_DENIED_FILE) {
+        const file = process.env.GEA_DEBUGGER_TEST_DENIED_FILE.replaceAll('\\', '/').replace(/^\/+/, '')
+        const denied = await fetch(new URL(`/@fs/${file}`, url))
+        assert.equal(denied.status, 403, 'files outside the app workspace are not exposed')
+      }
       const { root } = await cdp.send('DOM.getDocument', { depth: -1 })
       const { nodeId } = await cdp.send('DOM.querySelector', {
         nodeId: root.nodeId,

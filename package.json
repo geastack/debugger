@@ -12,7 +12,9 @@
   },
   "scripts": {
     "test": "node --test --test-concurrency=1 test/*.test.mjs",
-    "check": "node --check src/launch.mjs && node --check src/cdp.mjs && node --check src/native.mjs && node --check src/device.mjs && node --check src/gdb.mjs && node --check src/device-preview.mjs && node --check src/preview-fonts.mjs && node --check src/transport.mjs",
+    "check": "node --check src/launch.mjs && node --check src/cdp.mjs && node --check src/native.mjs && node --check src/lldb.mjs && node --check src/device.mjs && node --check src/css.mjs && node --check src/changes.mjs && node --check src/compat.mjs && node --check src/frontend.mjs && node --check src/html.mjs && node --check frontend/build.mjs && node --check frontend/patches.mjs && node --check frontend/gea-panels.mjs && node --check frontend/hosted-zoom.mjs && node --check src/gdb.mjs && node --check src/device-preview.mjs && node --check src/preview-fonts.mjs && node --check src/transport.mjs",
+    "build:frontend": "node frontend/build.mjs",
+    "prepack": "npm run build:frontend",
     "prepublishOnly": "npm run check && npm test"
   },
   "engines": {
@@ -20,6 +22,7 @@
   },
   "dependencies": {
     "@jridgewell/trace-mapping": "^0.3.31",
+    "es-module-lexer": "^3.0.3",
     "postcss": "^8.5.29",
     "ws": "^8.22.0"
   },
@@ -45,6 +48,9 @@
   "files": [
     "src/",
     "native/",
+    "frontend/",
+    ".build/devtools/",
+    "!.build/devtools/downloads.json",
     "docs/screenshots/",
     "README.md",
     "LICENSE",
